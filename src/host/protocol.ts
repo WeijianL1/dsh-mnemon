@@ -7,6 +7,10 @@ export type MemoryParticipationChannel = 'recall' | 'write' | 'projection' | 'ma
 export type MemoryLayerParticipation = Record<MemoryParticipationChannel, MemoryParticipationMode>
 export interface MemoryTopologyDefinition { id: string; strategyId: string; layers: Array<ResolvedMemoryLayerConfig & { id: string }> }
 export interface MemoryCompositionStatus {
+  /** Whether a composition serves new turns. A rejected change can leave the previous one serving. */
+  serving: boolean
+  /** The main Strategy composing the serving composition, which a fallback can make differ from the selected one. */
+  strategyTypeId?: string
   evaluation: import('../core/contracts/index.ts').MemoryCompositionEvaluationReport
   sources: MemorySourceManagementInstance[]
   configuration: ResolvedMemoryTopologyConfig
@@ -29,6 +33,16 @@ export const MNEMON_ACTIVATION_CHANNEL = '/dsh-mnemon-activation'
 export const MNEMON_WRITE_CHANNEL = '/dsh-mnemon-write'
 export const MNEMON_PACK_CHANNEL = '/dsh-mnemon-pack'
 export const MNEMON_SETTINGS_CHANNEL = '/dsh-mnemon-settings'
+/** DSH API Gateway endpoints used by paired remote Web clients. */
+export const MNEMON_REMOTE_CHANNEL = '/api'
+export const MNEMON_REMOTE_NAMESPACE = 'dshMnemon'
+export const MNEMON_REMOTE_READ_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/read`
+export const MNEMON_REMOTE_ACTIVATION_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/activation`
+export const MNEMON_REMOTE_WRITE_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/write`
+export const MNEMON_REMOTE_PACK_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/pack`
+export const MNEMON_REMOTE_SETTINGS_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/settings`
+export const MNEMON_REMOTE_VIEW_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/view`
+export const MNEMON_REMOTE_VIEW_WRITE_ENDPOINT = `${MNEMON_REMOTE_NAMESPACE}/viewWrite`
 export const MNEMON_SETTINGS_NAMESPACE = 'mnemon'
 export const MNEMON_UI_SETTINGS_NAMESPACE = 'mnemon-ui'
 export * from './view-protocol.ts'
@@ -84,7 +98,7 @@ export type RpcResult<T = JsonValue> =
   | { ok: false; error: RpcError }
 
 /** Public DSH browser RPC face plus the transport boundary needed to gate local-only writes. */
-export type ClientConnectionHandle = Pick<DshClientConnectionHandle, 'rpc'> & Partial<Pick<DshClientConnectionHandle, 'isLoopback'>>
+export type ClientConnectionHandle = Pick<DshClientConnectionHandle, 'rpc' | 'isLoopback'>
 
 export interface ClientSettingsSnapshot<T> {
   status: 'loading' | 'ready' | 'unavailable'
@@ -99,16 +113,16 @@ export interface ClientSettingsSnapshot<T> {
 export interface ClientSettingsScope<T> {
   getSnapshot(): ClientSettingsSnapshot<T>
   subscribe(listener: () => void): () => void
-  set(field: string, value: unknown): Promise<void>
-  unset(field: string): Promise<void>
-  setPath(path: string[], value: unknown): Promise<void>
-  unsetPath(path: string[]): Promise<void>
-  mutate?(ops: SettingsOperation[]): Promise<void>
+  mutate(ops: SettingsOperation[]): Promise<void>
 }
 
 export type SettingsOperation = { op: 'set'; path: string[]; value: unknown } | { op: 'unset'; path: string[] }
 
-export type StorageScopeKind = 'global' | 'workspace' | 'custom'
+export type StorageScopeKind = 'global' | 'workspace' | 'custom' | 'workspaces'
+
+export function isWorkspaceStorageScope(scope: string | undefined): boolean {
+  return scope === 'workspace' || scope === 'workspaces'
+}
 
 export interface MemoryLayerConfig {
   enabled?: boolean
@@ -158,6 +172,33 @@ export interface ResolvedRuntimeMemoryConfig {
 export { normalizeDisplayMode } from './display-mode.ts'
 export type MnemonDisplayMode = 'sidebar' | 'builtin'
 
+export const DEFAULT_IDLE_REVIEW = {
+  enabled: true,
+  runtimeMemory: true,
+  provider: 'spawn',
+  fallback: 'spawn',
+  agentTeams: 'pause',
+  minIntervalMs: 300_000,
+  maxPerSession: 20,
+  maxContextChars: 24_000,
+  maxTokens: 4_096,
+} satisfies ResolvedIdleReviewConfig
+
+export interface ResolvedIdleReviewConfig {
+  enabled: boolean
+  /** Whether review may change USER.md and MEMORY.md; it can create Documents either way. */
+  runtimeMemory: boolean
+  provider: 'spawn' | 'fork'
+  /** Applies only before a child starts; a failed run is never replayed. */
+  fallback: 'spawn' | 'skip'
+  /** Explicit opt-in for compatible Team policies; tool isolation is mandatory. */
+  agentTeams: 'pause' | 'scoped'
+  minIntervalMs: number
+  maxPerSession: number
+  maxContextChars: number
+  maxTokens: number
+}
+
 export interface Config {
   storageScope?: StorageScopeKind
   /** Whether USER.md follows the selected storage root or stays in the global root. */
@@ -173,18 +214,23 @@ export interface Config {
   /** Optional DSH-owned overrides injected into every Mnemon CLI process. */
   embedding?: MnemonEmbeddingConfig
   memoryTopology?: MemoryTopologyConfig
+  /** Profile-owned plugin choices on DSH 0.1.7 and newer. */
+  memoryView?: import('./view-protocol.ts').MemoryViewPreferences
+  /** Successful import of this profile's removed settings namespaces. */
+  legacySettingsImported?: boolean
   recallQuality?: RecallQualityConfig
   routingGuidance?: boolean
   /** Entry placement only. Legacy `buildin` input is migrated to `builtin`. */
   displayMode?: MnemonDisplayMode | 'buildin'
   tabEnabled?: boolean
   writeEnabled?: boolean
-  /** DSH rc.2 management-channel authority; ignored by DSH 0.1.2-alpha.1. */
+  /** Remote management grant for paired pages; loopback pages keep full access. */
   remoteAccess?: 'read-only' | 'trusted-host'
   lifecycleEnabled?: boolean
   recallMode?: 'guided' | 'off'
   writebackMode?: 'guided' | 'off'
   idleReviewMs?: number
+  idleReview?: Partial<ResolvedIdleReviewConfig>
   conversationInteraction?: {
     toolviews?: boolean
     turnBar?: boolean
@@ -256,12 +302,13 @@ export interface ResolvedConfig {
   displayMode: MnemonDisplayMode
   tabEnabled: boolean
   writeEnabled: boolean
-  /** DSH rc.2 management-channel authority; ignored by DSH 0.1.2-alpha.1. */
+  /** Remote management grant for paired pages; loopback pages keep full access. */
   remoteAccess: 'read-only' | 'trusted-host'
   lifecycleEnabled: boolean
   recallMode: 'guided' | 'off'
   writebackMode: 'guided' | 'off'
   idleReviewMs: number
+  idleReview: ResolvedIdleReviewConfig
   conversationInteraction: {
     toolviews: boolean
     turnBar: boolean
@@ -423,8 +470,20 @@ export interface LifecycleAgentSnapshot {
   lastReviewAction?: string
   lastReviewScore?: number
   lastReviewDocumentIds?: string[]
+  idleReviewAttempts?: number
+  idleReviewBlocked?: 'agent-team'
+  nextReviewAt?: string
+  lastReviewFailure?: IdleReviewFailure
   lastAt?: string
   lastError?: string
+}
+
+/** Reconciliation metadata only; raw tool arguments and memory content stay private. */
+export interface IdleReviewFailure {
+  status: 'failed' | 'partial'
+  runId?: string
+  provider: string
+  receipts: Array<{ tool: string; action: string; documentId?: string; target?: string; revision?: string }>
 }
 
 export interface LifecycleSnapshot {
@@ -445,7 +504,10 @@ export interface StatusView {
   healthy: boolean
   error?: string
   version?: string
+  /** The dsh-mnemon version this Host runs, which an installed update replaces only when DSH restarts. */
   dshMnemonVersion?: string
+  /** Updates installed while this Host runs; they load when DSH restarts. */
+  restartPending?: VersionRestartStatus
   cliPath: string
   commandFound: boolean
   dataDir: string
@@ -476,6 +538,8 @@ export interface StatusView {
 }
 
 export type MnemonPackComponent = 'runtime' | 'documents' | 'memory-spaces'
+/** The Sources that keep their data in Mnemon's data directory, in the order a backup lists them. */
+export const MNEMON_PACK_COMPONENTS = ['runtime', 'documents', 'memory-spaces'] as const satisfies readonly MnemonPackComponent[]
 export type MnemonPackScope = 'full' | MnemonPackComponent
 export type MnemonPackImportMode = 'merge' | 'replace'
 
@@ -494,6 +558,13 @@ export interface MnemonPackManifest {
   source: { plugin: 'dsh-mnemon'; pluginVersion: string }
   components: MnemonPackComponent[]
   summary: MnemonPackComponentSummary[]
+}
+
+/** Where memory lives now, and where the global scope keeps it when no directory is chosen. */
+export interface MnemonPackTarget {
+  root: string
+  scope: StorageScopeKind
+  defaultRoot: string
 }
 
 export interface MnemonPackExport {
@@ -554,6 +625,26 @@ export interface VersionPackageStatus extends VersionComponentStatus {
 export interface VersionStatus {
   checkedAt: string
   components: VersionComponentStatus[]
+  /** How the last update this Host ran from Check versions ended, for a page DSH swapped in meanwhile. */
+  lastUpdate?: VersionUpdateOutcome
+}
+
+export interface VersionUpdateOutcome {
+  at: string
+  component: VersionComponentId
+  /** The update's reply, when it ended without an error. */
+  result?: VersionUpdateResult
+  /** Why it failed, when it did. */
+  error?: string
+}
+
+export interface VersionRestartStatus {
+  /** The dsh-mnemon version this Host runs. */
+  running: string
+  /** The dsh-mnemon version now installed, when it differs, however it was installed: Check versions or `dsh plugin`, for example. */
+  installed?: string
+  /** Packages Check versions updated on their own. */
+  packages?: VersionPackageId[]
 }
 
 export interface VersionUpdateResult {

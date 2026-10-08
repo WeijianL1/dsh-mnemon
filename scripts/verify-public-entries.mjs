@@ -1,7 +1,9 @@
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from 'typescript'
+import { localeExport, readPackageLocales } from './package-locales.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const excluded = new Set(['./client', './package.json'])
@@ -37,11 +39,20 @@ function verifyDeclarations(filename) {
 }
 
 let imported = 0
+let executables = 0
 for (const directory of [root, resolve(root, 'plugins/dsh-mnemon-source-memory-spaces'), resolve(root, 'plugins/dsh-mnemon-strategy-default-three-tier')]) {
   const manifest = JSON.parse(readFileSync(resolve(directory, 'package.json'), 'utf8'))
+  for (const executable of Object.values(manifest.bin ?? {})) {
+    execFileSync(process.execPath, [resolve(directory, executable), '--help'], { encoding: 'utf8', timeout: 10_000 })
+    executables++
+  }
   for (const [subpath, descriptor] of Object.entries(manifest.exports)) {
     if (excluded.has(subpath)) continue
     const label = manifest.name + (subpath === '.' ? '' : subpath.slice(1))
+    if (subpath === localeExport) {
+      readPackageLocales(directory, manifest)
+      continue
+    }
     if (subpath.startsWith('./presentation/') && typeof descriptor === 'string') {
       const asset = readFileSync(resolve(directory, descriptor), 'utf8')
       if (subpath.endsWith('.json')) JSON.parse(asset)
@@ -65,4 +76,4 @@ for (const directory of [root, resolve(root, 'plugins/dsh-mnemon-source-memory-s
   }
 }
 
-console.log(`Imported ${imported} Node-compatible entries; verified ${publicTypes.size} public type dependencies on ${process.version}.`)
+console.log(`Imported ${imported} Node-compatible entries; verified ${publicTypes.size} public type dependencies and ${executables} executable help entry on ${process.version}.`)

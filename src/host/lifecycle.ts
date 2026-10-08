@@ -14,8 +14,9 @@ import type {
 import type { Insight, RememberRequest, SearchRequest } from 'dsh-mnemon-source-memory-spaces/contracts'
 import type { RuntimeMemoryMutation } from 'dsh-mnemon-source-runtime/contracts'
 import type { DocumentMutation } from 'dsh-mnemon-source-documents/contracts'
-import { MnemonSubagentCoordinator, type DelegatedWriteResult } from './subagent.ts'
+import { IdleReviewError, MnemonSubagentCoordinator, type DelegatedWriteResult } from './subagent.ts'
 import { scoreReviewActivity } from './review-activity.ts'
+import { idleReviewBlockReason } from './review-tools.ts'
 import { TurnActivityProjection, type TurnMemoryActivity, type TurnMemoryActivitySnapshot } from './activity.ts'
 import { applyMemoryViewGuidance } from './guidance.ts'
 import { modelMemoryWake } from './view-presentation.ts'
@@ -24,7 +25,7 @@ import type { AssistantMessageText, LifecycleAgentSnapshot, LifecycleCounters, L
 import type { PreparedMemoryPlacement } from 'dsh-mnemon-source-memory-spaces/contracts'
 import type { MemoryWake } from "../core/contracts/index.ts"
 import { agentScope, type MnemonAgentRuntimeSource } from './runtime.ts'
-import { hostSessionEventAt, hostSessionEvents } from './session-events.ts'
+import { createPluginMessage, MNEMON_PLUGIN_SOURCE } from './plugin-message.ts'
 
 type AgentRuntimeSource = Pick<MnemonAgentRuntimeSource, 'forAgent' | 'executions'>
 
@@ -55,7 +56,7 @@ function llmService(value: unknown): HostLlmService | undefined {
 export type { TurnMemoryActivity, TurnMemoryActivitySnapshot } from './activity.ts'
 export type { AssistantMessageText, LifecycleAgentSnapshot, LifecycleCounters, LifecyclePhase, LifecycleSnapshot } from "./protocol.ts"
 
-export const MNEMON_PLUGIN_SOURCE = 'dsh-mnemon'
+export { MNEMON_PLUGIN_SOURCE }
 
 export interface SupervisedWritebackResult extends DelegatedWriteResult { sessionId: string }
 
@@ -90,22 +91,13 @@ interface PromptAssemblyContext {
   signal?: AbortSignal
 }
 
-function createPluginMessage(text: string, form: 'recall' | 'notice' | 'instructions', summary?: string): HostUserMessage {
-  return structuredClone({
-    id: crypto.randomUUID(),
-    role: 'user' as const,
-    content: [{ type: 'text' as const, text }],
-    source: {
-      kind: 'plugin',
-      plugin: MNEMON_PLUGIN_SOURCE,
-      form,
-      ...(summary === undefined ? {} : { summary }),
-    },
-  })
-}
-
-function sourceOf(message: HostUserMessage): { kind?: string; plugin?: string } {
-  return message.source
+function isMnemonMessageSource(source: unknown): boolean {
+  if (typeof source !== 'object' || source === null) return false
+  const { kind, plugin } = source as { kind?: unknown; plugin?: unknown }
+  // V3-to-V4 migrates the legacy plugin wrapper to `plugin:dsh-mnemon`.
+  return kind === MNEMON_PLUGIN_SOURCE
+    || kind === `plugin:${MNEMON_PLUGIN_SOURCE}`
+    || (kind === 'plugin' && plugin === MNEMON_PLUGIN_SOURCE)
 }
 
 /**
@@ -113,10 +105,7 @@ function sourceOf(message: HostUserMessage): { kind?: string; plugin?: string } 
  */
 function isOwnUserMessageEvent(event: HostSessionEvent | undefined): boolean {
   if (event?.type !== 'user/message') return false
-  const source = event.data.source
-  if (typeof source !== 'object' || source === null) return false
-  const { kind, plugin } = source as { kind?: unknown; plugin?: unknown }
-  return kind === 'plugin' && plugin === MNEMON_PLUGIN_SOURCE
+  return isMnemonMessageSource(event.data.source)
 }
 
 function eventTurn(event: HostSessionEvent): number | undefined {
@@ -220,12 +209,6 @@ class MnemonAgentLifecycle {
     noMaintenance: boolean
   }>()
   /**
-   * Fallback presence marker for hosts that publish no surface projection.
-   * A host with a surface answers the question from what the model can
-   * actually see, which is what makes a rewind self-correcting.
-   */
-  private cueInjected = false
-  /**
    * Text of the runtime memory snapshot most recently injected as this
    * plugin's own message. `.context()` used to get supersede-on-change for free
    * from the host's runtime-context projection; carrying the snapshot as an own
@@ -240,9 +223,13 @@ class MnemonAgentLifecycle {
   private lastReviewAction: string | undefined
   private lastReviewScore: number | undefined
   private lastReviewDocumentIds: string[] | undefined
+  private idleReviewAttempts = 0
+  private lastReviewAttemptAt: number | undefined
+  private lastReviewFailure: LifecycleAgentSnapshot['lastReviewFailure']
   private lastPhase: LifecyclePhase = 'idle'
   private lastAt: string | undefined
   private lastError: string | undefined
+  private composedTurn: { turn: number; strategyTypeId: string } | undefined
 
   constructor(
     readonly agent: HostAgent,
@@ -257,19 +244,6 @@ class MnemonAgentLifecycle {
 
   start(): () => void {
     const disposers = [
-      this.agent.ctx.on('agent/session-start', ((payload: SessionStartPayload) => {
-        this.releaseView()
-        this.memoryTurn?.clearInspection()
-        this.cancelIdleReview(true)
-        this.guidedTurns.clear()
-        this.turnActivity.clear()
-        this.memoryActivity.reset()
-        this.startSource = payload.source
-        this.primePending = true
-        this.cueInjected = false
-        this.injectedMemoryText = undefined
-        this.mark('prime')
-      }) as never),
       this.agent.ctx.on('session/event', ((session: HostAgent['session'], event: HostSessionEvent) => this.sessionEvent(session, event)) as never),
       this.agent.ctx.on('system-prompt/assemble', ((assembly: PromptAssembly, context: PromptAssemblyContext, next: () => Promise<PromptAssembly>) => this.assemblePrompt(assembly, context, next)) as never),
       // `prepend: true` makes this the outermost pre-step participant, so it
@@ -294,10 +268,14 @@ class MnemonAgentLifecycle {
       startSource: this.startSource,
       primePending: this.primePending,
       guidedTurns: this.guidedTurns.size,
-      memoryToolCalls: memoryToolCalls(hostSessionEvents(this.agent.session)),
+      memoryToolCalls: memoryToolCalls(this.agent.session.snapshotEvents()),
       idleReviewPending: this.idleReviewTimer !== undefined,
       reviewRunning: this.reviewRunning,
       reviewActivity: this.reviewActivity(),
+      idleReviewAttempts: this.idleReviewAttempts,
+      ...(idleReviewBlockReason(this.agent, this.config.idleReview.agentTeams) === undefined ? {} : { idleReviewBlocked: 'agent-team' as const }),
+      ...(this.lastReviewAttemptAt === undefined ? {} : { nextReviewAt: new Date(this.lastReviewAttemptAt + this.config.idleReview.minIntervalMs).toISOString() }),
+      ...(this.lastReviewFailure === undefined ? {} : { lastReviewFailure: this.lastReviewFailure }),
       lastPhase: this.lastPhase,
       ...(this.lastReviewAt === undefined ? {} : { lastReviewAt: this.lastReviewAt }),
       ...(this.lastReviewAction === undefined ? {} : { lastReviewAction: this.lastReviewAction }),
@@ -315,12 +293,12 @@ class MnemonAgentLifecycle {
 
   /** Incremental snapshot of settled Mnemon activity in this durable log. */
   turnMemoryActivities(): TurnMemoryActivitySnapshot {
-    return this.memoryActivity.snapshot(hostSessionEvents(this.agent.session))
+    return this.memoryActivity.snapshot(this.agent.session.snapshotEvents())
   }
 
   /** Plain text of one finalized assistant message, from this agent's session log. */
   assistantMessageText(messageId: string): AssistantMessageText | null {
-    return assistantMessageText(hostSessionEvents(this.agent.session), messageId)
+    return assistantMessageText(this.agent.session.snapshotEvents(), messageId)
   }
 
   memoryWake(): MemoryWake | undefined {
@@ -332,20 +310,18 @@ class MnemonAgentLifecycle {
   /**
    * Whether the reminder is still visible to the model.
    *
-   * Read from the surface rather than from `cueInjected`, because a rewind is a
-   * surface replacement inside the same live session: it does not emit
-   * `agent/session-start`, so a session-scoped flag stays set and the reminder
-   * never returns. The durable event log cannot answer this either, since it is
-   * append-only and still contains the discarded message.
+   * Read from the surface rather than an Agent-scoped flag, because a rewind
+   * is a surface replacement inside the same live Agent: DSH does not recreate
+   * the Agent, so a flag would stay set and the reminder would never return.
+   * The durable event log cannot answer this either, since it is append-only
+   * and still contains the discarded message.
    *
    * Scanning forward is cheap: the reminder sits near the head of the surface,
    * so the loop exits after a few nodes even on a long session.
    */
   private cueAlreadyVisible(): boolean {
-    const nodes = this.agent.session.surface?.nodes
-    if (nodes === undefined) return this.cueInjected
-    for (const seq of nodes) {
-      if (isOwnUserMessageEvent(hostSessionEventAt(this.agent.session, seq))) return true
+    for (const seq of this.agent.session.surface.nodes) {
+      if (isOwnUserMessageEvent(this.agent.session.eventAt(seq))) return true
     }
     return false
   }
@@ -366,7 +342,7 @@ class MnemonAgentLifecycle {
     const text = wake.text
     if (text.trim() === '' || text === this.injectedMemoryText) return undefined
     this.injectedMemoryText = text
-    return createPluginMessage(text, 'recall', 'Memory View snapshot')
+    return createPluginMessage(text, 'recall')
   }
 
   private async preStep(payload: PreStepPayload, next: () => Promise<HostPreStepDecision>): Promise<HostPreStepDecision> {
@@ -382,10 +358,7 @@ class MnemonAgentLifecycle {
     }
     if (payload.step !== 1) return decision
 
-    const ownRequest = decision.messages.some(message => {
-      const source = sourceOf(message)
-      return source.kind === 'plugin' && source.plugin === MNEMON_PLUGIN_SOURCE
-    })
+    const ownRequest = decision.messages.some(message => isMnemonMessageSource(message.source))
     if (ownRequest) {
       return decision
     }
@@ -405,12 +378,11 @@ class MnemonAgentLifecycle {
     if (this.cueAlreadyVisible()) return { kind: 'enter', messages: withSnapshot(decision.messages) }
     const reminder = guidedReminder(this.config, this.memoryTurn?.current?.context.view.guidance)
     if (reminder === undefined) return { kind: 'enter', messages: withSnapshot(decision.messages) }
-    this.cueInjected = true
     this.guidedTurns.add(payload.turn)
     if (this.config.recallMode === 'guided') this.counters.recallCues += 1
     if (this.config.writebackMode === 'guided' && this.config.writeEnabled) this.counters.writebackCues += 1
     this.mark(this.config.recallMode === 'guided' ? 'recall' : 'writeback')
-    return { kind: 'enter', messages: withSnapshot([...decision.messages, createPluginMessage(reminder, 'instructions', 'Optional memory recall and remember reminder')]) }
+    return { kind: 'enter', messages: withSnapshot([...decision.messages, createPluginMessage(reminder, 'instructions')]) }
   }
 
   private async assemblePrompt(assembly: PromptAssembly, context: PromptAssemblyContext, next: () => Promise<PromptAssembly>): Promise<PromptAssembly> {
@@ -443,29 +415,53 @@ class MnemonAgentLifecycle {
   }
 
   private scheduleIdleReview(turn: number): void {
-    if (!this.config.lifecycleEnabled || !this.config.writeEnabled || this.config.writebackMode !== 'guided') return
-    // Automatic three-tier maintenance belongs to the default product, not to
-    // every third-party View Strategy. Explicit management remains available.
-    if (this.config.memoryTopology.strategyId !== 'default-three-tier') return
     this.cancelIdleReview(true)
+    if (!this.idleReviewAllowed() || !this.composedByDefault(turn)) return
     const activity = this.ensureTurnActivity(turn)
-    const tools = completedToolActivity(hostSessionEvents(this.agent.session), turn)
+    const tools = completedToolActivity(this.agent.session.snapshotEvents(), turn)
     activity.toolCallCount = tools.count
     activity.toolNames = tools.names
     if (!this.reviewActivity().eligible || !this.reviewAdmitted(turn)) return
     this.idleReviewTimer = setTimeout(() => {
       this.idleReviewTimer = undefined
-      if (this.config.memoryTopology.strategyId !== 'default-three-tier') return
+      if (!this.idleReviewAllowed() || this.reviewRunning) return
+      if (this.lastReviewAttemptAt !== undefined && Date.now() < this.lastReviewAttemptAt + this.config.idleReview.minIntervalMs) {
+        this.scheduleIdleReview(turn)
+        return
+      }
       if (this.agent.status !== 'idle') return
-      const completed = hostSessionEvents(this.agent.session).some(event => event.type === 'turn/end' && eventTurn(event) === turn)
+      const completed = this.agent.session.snapshotEvents().some(event => event.type === 'turn/end' && eventTurn(event) === turn)
       if (!completed || !this.reviewActivity().eligible || !this.reviewAdmitted(turn)) return
       void this.runIdleReview()
-    }, this.config.idleReviewMs)
+    }, Math.max(this.config.idleReviewMs, (this.lastReviewAttemptAt ?? -Infinity) + this.config.idleReview.minIntervalMs - Date.now()))
+  }
+
+  /**
+   * Automatic three-tier maintenance belongs to the default product, not to
+   * every third-party View Strategy, and only to turns that Strategy actually
+   * composed: a turn served by a fallback Strategy, or run without memory, has
+   * nothing for it to maintain. Explicit management remains available.
+   */
+  private composedByDefault(turn: number): boolean {
+    if (this.memoryTurn === undefined) return true
+    const pinned = this.memoryTurn.current
+    if (pinned?.turn === turn) this.composedTurn = { turn, strategyTypeId: pinned.context.view.strategyTypeId }
+    else if (this.composedTurn?.turn !== turn) this.composedTurn = undefined
+    return this.composedTurn?.strategyTypeId === 'default-three-tier'
+  }
+
+  private idleReviewAllowed(): boolean {
+    return this.config.lifecycleEnabled && this.config.writeEnabled && this.config.writebackMode === 'guided'
+      && this.config.idleReview.enabled && this.idleReviewAttempts < this.config.idleReview.maxPerSession
+      && idleReviewBlockReason(this.agent, this.config.idleReview.agentTeams) === undefined
+      && this.config.memoryTopology.strategyId === 'default-three-tier'
   }
 
   private async runIdleReview(): Promise<void> {
     const controller = new AbortController()
     const triggeredScore = this.reviewActivity().score
+    this.idleReviewAttempts += 1
+    this.lastReviewAttemptAt = Date.now()
     this.reviewRunning = true
     this.reviewController = controller
     this.mark('review')
@@ -476,10 +472,15 @@ class MnemonAgentLifecycle {
       this.lastReviewAction = result.action
       this.lastReviewScore = triggeredScore
       this.lastReviewDocumentIds = result.documentIds
+      this.lastReviewFailure = undefined
       this.turnActivity.clear()
+      this.lastError = undefined
       this.mark('review')
     } catch (error) {
-      if (!controller.signal.aborted) this.fail(error)
+      // Cancellation after a commit still needs reconciliation. Never retry a
+      // failed child here, even when a different provider is available.
+      if (error instanceof IdleReviewError) this.lastReviewFailure = error.review
+      if (!controller.signal.aborted || error instanceof IdleReviewError && error.review.status === 'partial') this.fail(error)
     } finally {
       if (this.reviewController === controller) {
         this.reviewRunning = false
@@ -537,7 +538,7 @@ class MnemonAgentLifecycle {
       explicitCandidate ||= activity.explicitCandidate
       completedNonMemoryTool ||= activity.toolCallCount > 0 && [...activity.toolNames].some(name => !name.startsWith('mnemon_'))
     }
-    const assistantTextLength = hostSessionEvents(this.agent.session)
+    const assistantTextLength = this.agent.session.snapshotEvents()
       .filter(event => {
         const turn = eventTurn(event)
         return turn !== undefined && turns.has(turn)
@@ -570,14 +571,16 @@ class MnemonAgentLifecycle {
   private mark(phase: LifecyclePhase): void {
     this.lastPhase = phase
     this.lastAt = new Date().toISOString()
-    this.lastError = undefined
   }
 
   private fail(error: unknown): void {
     this.counters.failures += 1
     this.lastPhase = 'error'
     this.lastAt = new Date().toISOString()
-    this.lastError = error instanceof Error ? error.message : String(error)
+    this.lastError = (error instanceof Error ? error.message : String(error))
+      .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, '[redacted]')
+      .replace(/\s+/gu, ' ').trim().slice(0, 500)
+    console.warn(`[dsh-mnemon] idle review failed: ${this.lastError}`)
   }
 
 }
@@ -601,7 +604,8 @@ export class MnemonLifecycle {
   ) {}
 
   start(): () => void {
-    const stopCreated = this.ctx.on('agent/created', (({ agent }: AgentEventPayload) => { this.install(agent, 'startup') }) as never)
+    // DSH creates a new Agent for startup, resume, clear and compaction alike.
+    const stopCreated = this.ctx.on('agent/created', (({ agent, source }: SessionStartPayload) => { this.install(agent, source) }) as never)
     for (const agent of this.ctx.agents.roots()) this.install(agent, 'adopted')
     return () => {
       stopCreated()
@@ -625,9 +629,7 @@ export class MnemonLifecycle {
       idleReviewMs: this.config.idleReviewMs,
       activeAgents: this.owners.size,
       sessionAvailable: agent !== undefined,
-      taskAgentAvailable: this.ctx.agents.create === undefined
-        ? agent !== undefined
-        : this.taskAgentModelOptions(requestedId ?? '', workspaceRoot) !== undefined,
+      taskAgentAvailable: this.taskAgentModelOptions(requestedId ?? '', workspaceRoot) !== undefined,
       counters: { ...this.counters },
       subagents: this.coordinator.snapshot(),
       ...(owner === undefined ? {} : { current: owner.snapshot() }),
@@ -754,6 +756,14 @@ export class MnemonLifecycle {
     return this.coordinator.runtime(this.liveAgent(sessionId), request, signal)
   }
 
+  manageSource(graph: import('./runtime.ts').MnemonRuntimeGraph, request: import('../core/contracts/index.ts').MemorySourceManagementRequest) {
+    return this.coordinator.manageSource(graph, request)
+  }
+
+  runRuntimeMaintenanceTask<T>(scope: import('../core/contracts/index.ts').MemoryOperationScope, signal: AbortSignal, operation: (agent: HostAgent) => Promise<T>): Promise<T> {
+    return this.runTaskAgent('', scope.workspaceId, signal, operation)
+  }
+
   documents(sessionId: string) {
     return this.coordinator.documentsSnapshot(this.liveAgent(sessionId))
   }
@@ -770,6 +780,17 @@ export class MnemonLifecycle {
     return this.coordinator.document(this.liveAgent(sessionId), request, signal)
   }
 
+  /**
+   * The same Document write under a fresh task Agent, for a conversation whose
+   * Agent is not loaded: it archives the least recently used Document to make
+   * room, as the conversation's Agent would.
+   */
+  mutateDocumentTask(sessionId: string, request: DocumentMutation, workspaceRoot?: string, signal = new AbortController().signal) {
+    const root = workspaceRoot?.trim() || this.workspaceRoot(sessionId)
+    if (root === undefined || root.trim() === '') throw new Error('a selected DSH workspace is required to write a Mnemon Document')
+    return this.runTaskAgent(sessionId, root, signal, agent => this.coordinator.document(agent, request, signal))
+  }
+
   archiveDocument(sessionId: string, id: string, workspaceRoot?: string, signal = new AbortController().signal) {
     const root = workspaceRoot?.trim() || this.workspaceRoot(sessionId)
     if (root === undefined || root.trim() === '') throw new Error('a selected DSH workspace is required to archive a Mnemon Document')
@@ -782,6 +803,12 @@ export class MnemonLifecycle {
 
   placeProvider(sessionId: string, body: { name: string; description: string }, prepared: PreparedMemoryPlacement, signal = new AbortController().signal) {
     return this.coordinator.placeProvider(this.liveAgent(sessionId), body, prepared, signal)
+  }
+
+  /** Choose a new Memory Space's Provider under a fresh task Agent, as Ask Agent does without a loaded conversation Agent. */
+  placeProviderTask(sessionId: string, body: { name: string; description: string }, prepared: PreparedMemoryPlacement, workspaceRoot?: string, signal = new AbortController().signal) {
+    const root = workspaceRoot?.trim() || this.workspaceRoot(sessionId)
+    return this.runTaskAgent(sessionId, root, signal, agent => this.coordinator.placeProvider(agent, body, prepared, signal))
   }
 
   maintainMetadata(sessionId: string, memoryBodyIds: readonly string[], workspaceRoot?: string, signal = new AbortController().signal) {
@@ -883,20 +910,13 @@ export class MnemonLifecycle {
     signal: AbortSignal,
     operation: (agent: HostAgent) => Promise<T>,
   ): Promise<T> {
-    const create = this.ctx.agents.create?.bind(this.ctx.agents)
-    if (create === undefined) {
-      const fallback = workspaceRoot === undefined ? this.ctx.agents.get(fallbackSessionId.trim()) ?? this.availableAgent() : this.availableAgent(workspaceRoot)
-      if (fallback === undefined) throw new Error('current DSH host cannot create a task Agent and no matching live Agent is available')
-      return operation(fallback)
-    }
-
     const sessionId = randomUUID()
     this.taskAgentIds.add(sessionId)
     let handle: HostAgentHandle | undefined
     let failure: unknown
     try {
       const creation = await this.taskAgentCreation(fallbackSessionId, workspaceRoot)
-      handle = await create({
+      handle = await this.ctx.agents.create({
         sessionId,
         ...creation,
         signal,
@@ -1028,7 +1048,6 @@ export class MnemonLifecycle {
         }
       }
       try {
-        stops.push(agent.ctx.on('agent/session-start', (() => memory.end()) as never))
         stops.push(agent.ctx.on('system-prompt/assemble', (async (_assembly: PromptAssembly, context: PromptAssemblyContext, next: () => Promise<PromptAssembly>) => {
           if (context.agent !== undefined && context.agent !== agent) return next()
           const turn = openAgentTurn(agent)

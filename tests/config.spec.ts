@@ -4,6 +4,12 @@ import { Config, resolveConfig } from "../src/host/config.ts"
 afterEach(() => vi.unstubAllEnvs())
 
 describe('Mnemon config and resolution', () => {
+  it.each([{ maxPerSession: -1 }, { maxPerSession: 201 }, { minIntervalMs: 0 }, { maxContextChars: 1 }, { maxTokens: 0 }, { provider: 'unisolated' }, { agentTeams: 'unrestricted' }, { runtimeMemory: 'documents' }])('rejects invalid idle review policy %j', idleReview => {
+    expect(() => resolveConfig({ idleReview } as never)).toThrow()
+  })
+  it('keeps idle review to Documents only when runtime memory is off', () => {
+    expect(resolveConfig({ idleReview: { runtimeMemory: false } }).idleReview).toMatchObject({ enabled: true, runtimeMemory: false, provider: 'spawn' })
+  })
   it('materializes conservative defaults', () => {
     expect(resolveConfig({})).toMatchObject({
       storageScope: 'global',
@@ -42,6 +48,7 @@ describe('Mnemon config and resolution', () => {
       recallMode: 'guided',
       writebackMode: 'guided',
       idleReviewMs: 30_000,
+      idleReview: { enabled: true, runtimeMemory: true, provider: 'spawn', fallback: 'spawn', agentTeams: 'pause', minIntervalMs: 300_000, maxPerSession: 20, maxContextChars: 24_000, maxTokens: 4_096 },
       displayMode: 'sidebar',
       tabEnabled: true,
       writeEnabled: true,
@@ -130,10 +137,6 @@ describe('Mnemon config and resolution', () => {
       .toThrow('at least one allowed provider')
   })
 
-  it('retains the rc.2 management authority setting for branch-free rollback compatibility', () => {
-    expect(resolveConfig({ remoteAccess: 'trusted-host' }).remoteAccess).toBe('trusted-host')
-  })
-
   it('keeps explicit conversation-surface opt-outs', () => {
     expect(resolveConfig({ conversationInteraction: { turnBar: false, saveAction: false } }).conversationInteraction)
       .toMatchObject({ turnBar: false, saveAction: false })
@@ -199,4 +202,18 @@ describe('Mnemon config and resolution', () => {
     expect(() => resolveConfig({ store: '../other' })).toThrow('store')
   })
 
+})
+
+describe('centralized workspace configuration', () => {
+  it('accepts default, home-relative and custom central roots with either USER.md scope', () => {
+    for (const runtimeUserScope of ['storage', 'global'] as const) {
+      for (const dataDir of [undefined, '', '~/central-memory', '/central-memory']) {
+        const input = { storageScope: 'workspaces' as const, runtimeUserScope, ...(dataDir === undefined ? {} : { dataDir }) }
+        expect(resolveConfig(Config(input))).toMatchObject({ storageScope: 'workspaces', runtimeUserScope })
+      }
+    }
+    expect(() => resolveConfig({ storageScope: 'workspaces', dataDir: 'relative' })).toThrow('absolute')
+    expect(() => resolveConfig({ storageScope: 'workspaces', dataDir: '/root\0' })).toThrow('null byte')
+    expect(() => resolveConfig({ storageScope: 'unknown' as never })).toThrow('storageScope')
+  })
 })

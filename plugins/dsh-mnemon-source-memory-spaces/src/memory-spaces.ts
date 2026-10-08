@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import type { MnemonRunner, MnemonTextCommand } from './runner.ts'
-import type { MemoryPlacementCandidate } from './provider-placement.ts'
 import {
   EMPTY_MEMORY_PROVIDER_CATALOG,
   type MemoryProviderCatalog,
@@ -11,6 +10,7 @@ import type {
   CreateMemorySpaceRequest,
   MemorySpace,
   MemorySpaceProvider,
+  MemoryPlacementCandidate,
   MemoryPlacementDecision,
   MemoryProviderServiceCatalog,
   MemoryProviderServiceView,
@@ -21,8 +21,6 @@ import type {
   UpdateMemorySpaceRequest,
 } from './contracts.ts'
 import type { ProviderMemorySpace } from './providers/adapter.ts'
-
-export type { CreateMemorySpaceRequest, MemorySpace, UpdateMemorySpaceRequest } from './contracts.ts'
 
 const NATIVE_REGISTRY_VERSION = 1
 const PROVIDER_REGISTRY_VERSION = 4
@@ -270,18 +268,6 @@ export class MemorySpaceRegistry {
     return body
   }
 
-  openVikingConnection(id: string): OpenVikingSpaceConnection {
-    const connection = this.providerConnection(id, 'openviking')
-    return {
-      endpoint: String(connection.endpoint ?? ''),
-      targetUri: String(connection.targetUri ?? ''),
-      apiKey: String(connection.apiKey ?? ''),
-      account: String(connection.account ?? ''),
-      user: String(connection.user ?? ''),
-      actorPeerId: String(connection.actorPeerId ?? ''),
-    }
-  }
-
   providerConnection(id: string, expectedProviderId?: MemoryProviderId): MemoryProviderConnection {
     this.refreshIfChanged()
     const normalized = validateMemorySpaceId(id)
@@ -314,6 +300,16 @@ export class MemorySpaceRegistry {
     return this.isNative(providerId)
       ? this.runner.commandFound
       : this.providerServiceConfigured(providerId) && this.serviceEnabled[providerId] === true
+  }
+
+  /**
+   * The provider used when none is named: Mnemon Native while its CLI is
+   * available, which keeps the long-standing default, otherwise the first
+   * other provider, in catalog order, that can take writes now.
+   */
+  defaultProviderId(): MemoryProviderId | undefined {
+    const ready = this.providerCatalog.providers.filter(provider => this.providerServiceEnabled(provider.id))
+    return (ready.find(provider => this.isNative(provider.id)) ?? ready[0])?.id
   }
 
   providerServices(options: { includeSecrets?: boolean } = {}): MemoryProviderServiceCatalog {
@@ -364,6 +360,8 @@ export class MemorySpaceRegistry {
     let normalizedService = this.providerCatalog.normalizeService(providerId, service)
     const seen = new Set<string>()
     const existing = this.spaces.filter(body => body.providerId === providerId)
+    const existingByExternalId = new Map<string | undefined, StoredMemorySpace>()
+    for (const body of existing) if (!existingByExternalId.has(body.externalId)) existingByExternalId.set(body.externalId, body)
     const reservedIds = new Set(this.spaces.filter(body => body.providerId !== providerId).map(body => body.id))
     const timestamp = this.now().toISOString()
     const projections = discovered.map(candidate => {
@@ -372,7 +370,7 @@ export class MemorySpaceRegistry {
       seen.add(externalId)
       const connection = this.providerCatalog.normalizeMemory(providerId, candidate.connection)
       this.providerCatalog.normalize(providerId, { ...normalizedService, ...connection })
-      const previous = existing.find(body => body.externalId === externalId)
+      const previous = existingByExternalId.get(externalId)
       let id = previous?.id ?? validateMemorySpaceId(`${providerId}-${createHash('sha256').update(externalId).digest('hex').slice(0, 24)}`)
       let suffix = 1
       while (reservedIds.has(id)) {
@@ -446,7 +444,8 @@ export class MemorySpaceRegistry {
     const description = requiredText(request.description, 'description', 1000)
     if (request.placement !== undefined && placement === undefined) throw new Error('automatic provider placement must be resolved before creating a Memory Space')
     if (placement !== undefined && request.providerId !== undefined && request.providerId !== placement.providerId) throw new Error('resolved provider placement conflicts with providerId')
-    const providerId = placement?.providerId ?? request.providerId ?? 'mnemon-native'
+    const providerId = placement?.providerId ?? request.providerId ?? this.defaultProviderId()
+    if (providerId === undefined) throw new Error('No memory provider is ready: install the Mnemon CLI to use Mnemon Native, or connect another provider on the dsh-mnemon page under Plugins')
     if (!this.providerCatalog.has(providerId)) throw new Error(`unsupported memory provider: ${String(providerId)}`)
     const normalizedPlacement = placement === undefined ? undefined : normalizePlacementDecision(placement, providerId, this.providerCatalog)
     if (placement !== undefined && normalizedPlacement === undefined) throw new Error('resolved provider placement is invalid')
@@ -468,7 +467,7 @@ export class MemorySpaceRegistry {
         this.services[providerId] = this.providerCatalog.normalizeService(providerId, split.service, this.services[providerId] ?? {})
         this.serviceEnabled[providerId] = true
       }
-      if (!this.providerServiceEnabled(providerId)) throw new Error(`${this.providerCatalog.descriptor(providerId).label} service is not enabled; enable it in Settings first`)
+      if (!this.providerServiceEnabled(providerId)) throw new Error(`${this.providerCatalog.descriptor(providerId).label} service is not enabled; enable it on the dsh-mnemon page under Plugins first`)
       connection = this.providerCatalog.normalizeMemory(providerId, split.memory)
       this.providerCatalog.normalize(providerId, { ...this.services[providerId], ...connection })
     }
@@ -516,7 +515,7 @@ export class MemorySpaceRegistry {
         this.services[current.providerId] = this.providerCatalog.normalizeService(current.providerId, split.service, this.services[current.providerId] ?? {}, clearSecrets)
         this.serviceEnabled[current.providerId] = true
       }
-      if (!this.providerServiceEnabled(current.providerId)) throw new Error(`${this.providerCatalog.descriptor(current.providerId).label} service is not enabled; enable it in Settings first`)
+      if (!this.providerServiceEnabled(current.providerId)) throw new Error(`${this.providerCatalog.descriptor(current.providerId).label} service is not enabled; enable it on the dsh-mnemon page under Plugins first`)
       connection = this.providerCatalog.normalizeMemory(current.providerId, split.memory, previousConnection)
       this.providerCatalog.normalize(current.providerId, { ...this.services[current.providerId], ...connection })
     }
@@ -793,9 +792,10 @@ export class MemorySpaceRegistry {
     const timestamp = this.now().toISOString()
     const legacyActive = this.runner.effectiveStore()
     let changed = false
+    const knownIds = new Set(this.spaces.map(body => body.id))
     for (const entry of readdirSync(this.directory, { withFileTypes: true })) {
       if (!entry.isDirectory() || !ID_PATTERN.test(entry.name) || !existsSync(join(this.directory, entry.name, 'mnemon.db'))) continue
-      if (this.spaces.some(body => body.id === entry.name)) continue
+      if (knownIds.has(entry.name)) continue
       this.spaces.push({
         id: entry.name,
         name: entry.name,
@@ -805,6 +805,7 @@ export class MemorySpaceRegistry {
         createdAt: timestamp,
         updatedAt: timestamp,
       })
+      knownIds.add(entry.name)
       changed = true
     }
     if (changed) this.save()

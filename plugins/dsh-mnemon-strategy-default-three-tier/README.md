@@ -20,6 +20,16 @@ Host renders them for the selected turn; a different Strategy does not inherit
 this plugin's instructions. DSH-assisted write/archival workflows remain Host
 adapters over Source operations; Core does not schedule autonomous maintenance.
 
+The public `threeTierActionWorkflow` policy in `./extension-sdk` identifies Runtime
+capacity maintenance only while this Strategy is selected. The DSH Host applies
+it to named tools, generic View Actions, child writes and browser management.
+The operation retains its exact Source instance, scope, revision and authority;
+archive destinations stay within the selected writable Source and pinned
+namespaces. A browser write needs no conversation. One eligible destination
+requires no model; routing and local profile compaction use a clean workspace
+task Agent when needed. Sources retain their independent storage protocols,
+and other Strategies do not acquire this workflow implicitly.
+
 ## Additive plugins
 
 The selected complete Strategy still produces one View. Its optional, exclusive
@@ -38,6 +48,9 @@ names and value schemas belong to this Strategy, not to Core. External authors
 use `defineThreeTierExtension` and `installMemory(ctx, { strategyExtensions: [...] })`.
 
 All Sources share the existing turn's read quotas and one projection budget.
+Runtime guidance describes snapshots as budget-limited even without extensions:
+metadata on many short entries can exceed the projection budget while stored
+content remains within capacity. An omitted entry is not evidence of deletion.
 Replay and Related admission include the exact Source instance identity. Writes
 still require an offered Action and Host authorization, including implicit
 capacity maintenance. Explicit operator management is a separate channel.

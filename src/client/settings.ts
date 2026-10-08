@@ -6,6 +6,7 @@ import {
   type ClientSettingsSnapshot,
   type SettingsOperation,
 } from "../host/protocol.ts"
+import { callMnemonRpc } from './remote-rpc.ts'
 
 export class MnemonSettingsScope<T extends object> implements ClientSettingsScope<T> {
   private snapshot: ClientSettingsSnapshot<T> = { status: 'loading', writable: false, mode: 'host' }
@@ -27,26 +28,27 @@ export class MnemonSettingsScope<T extends object> implements ClientSettingsScop
     return () => this.listeners.delete(listener)
   }
 
-  set(field: string, value: unknown): Promise<void> {
-    return this.mutate([{ op: 'set', path: [field], value }])
-  }
-
-  unset(field: string): Promise<void> {
-    return this.mutate([{ op: 'unset', path: [field] }])
-  }
-
-  /** Set a nested field. */
-  setPath(path: string[], value: unknown): Promise<void> {
-    return this.mutate([{ op: 'set', path, value }])
-  }
-
-  /** Unset a nested field, falling back to its schema default. */
-  unsetPath(path: string[]): Promise<void> {
-    return this.mutate([{ op: 'unset', path }])
-  }
-
+  /** Queue one revision-fenced Host write of these operations. */
   mutate(ops: SettingsOperation[]): Promise<void> {
     return this.write(ops)
+  }
+
+  /**
+   * Re-read the Host snapshot after a change made elsewhere. Queued behind
+   * writes so an older read never replaces a newer answer; a failed read
+   * keeps the current snapshot.
+   */
+  refresh(): Promise<void> {
+    const task = this.tail.then(async () => {
+      try {
+        const response = await this.call('get', { namespace: this.namespace })
+        if (response.ok) this.publish(response.value as ClientSettingsSnapshot<T>)
+      } catch {
+        // Keep the snapshot the page already shows.
+      }
+    })
+    this.tail = task
+    return task
   }
 
   private async load(): Promise<void> {
@@ -83,7 +85,7 @@ export class MnemonSettingsScope<T extends object> implements ClientSettingsScop
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), Math.max(1, this.requestTimeoutMs))
     try {
-      return await this.connection.rpc.call(MNEMON_SETTINGS_CHANNEL, endpoint, payload, controller.signal)
+      return await callMnemonRpc(this.connection, MNEMON_SETTINGS_CHANNEL, endpoint, payload, controller.signal)
     } catch (error) {
       if (controller.signal.aborted) throw new Error('Mnemon settings request timed out')
       throw error

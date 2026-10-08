@@ -22,6 +22,7 @@ import type {
   RuntimeMemoryCompactedEntry,
   RuntimeMemoryEntry,
   RuntimeMemoryImportance,
+  RuntimeMemoryMaintenancePlan,
   RuntimeMemoryMutation,
   RuntimeMemoryMutationResult,
   RuntimeMemorySnapshot,
@@ -29,22 +30,7 @@ import type {
   RuntimeMemoryTargetView,
   RuntimeMemoryUsage,
 } from './contracts.ts'
-
-export type {
-  RuntimeMemoryAction,
-  RuntimeMemoryCompactedEntry,
-  RuntimeMemoryEntry,
-  RuntimeMemoryImportance,
-  RuntimeMemoryMutation,
-  RuntimeMemoryMutationResult,
-  RuntimeMemorySnapshot,
-  RuntimeMemoryTarget,
-  RuntimeMemoryTargetView,
-  RuntimeMemoryUsage,
-} from './contracts.ts'
-
 import { RUNTIME_MEMORY_VERSION, RUNTIME_ENTRY_DELIMITER, RUNTIME_MEMORY_LIMITS, type RuntimeMemoryLimits } from './contracts.ts'
-export { RUNTIME_MEMORY_VERSION, RUNTIME_ENTRY_DELIMITER, RUNTIME_MEMORY_LIMITS, type RuntimeMemoryLimits } from './contracts.ts'
 
 export interface RuntimeMemoryContextProjection {
   revision: string
@@ -75,10 +61,6 @@ interface PreparedRuntimeMemoryMutation {
   excludedEntry?: RuntimeMemoryEntry
   fields: RuntimeMemoryResultFields
 }
-
-/** Host-only plan for capacity maintenance; this is not exposed as a Tool or RPC action. */
-import type { RuntimeMemoryMaintenancePlan } from './contracts.ts'
-export type { RuntimeMemoryMaintenancePlan } from './contracts.ts'
 
 export class RuntimeMemoryCapacityError extends Error {
   readonly code = 'runtime-capacity' as const
@@ -201,6 +183,20 @@ function markdown(entries: readonly RuntimeMemoryEntry[], target: RuntimeMemoryT
   return content === '' ? '' : `${content}\n`
 }
 
+function age(timestamp: string, projectedAt: number): string {
+  const time = Date.parse(timestamp)
+  if (!Number.isFinite(time)) return 'unknown'
+  if (time > projectedAt) return 'future'
+  return `${Math.floor((projectedAt - time) / 86_400_000)}d`
+}
+
+/** Prompt-only annotations; stored content, matching and capacity stay unchanged. */
+function contextMarkdown(entries: readonly RuntimeMemoryEntry[], target: RuntimeMemoryTarget, projectedAt: number): string {
+  return entries.filter(entry => entry.target === target).map(entry =>
+    `[importance=${entry.importance}; created=${age(entry.created_at, projectedAt)}; updated=${age(entry.updated_at, projectedAt)}]\n${entry.content}`,
+  ).join(RUNTIME_ENTRY_DELIMITER)
+}
+
 function revision(file: RuntimeMemoryFile): string {
   return createHash('sha256').update(JSON.stringify(file)).digest('hex')
 }
@@ -246,9 +242,12 @@ function prepareMutation(
   }
 
   const oldText = normalizeContent(request.oldText, 'oldText')
-  const matches = entries
+  const substringMatches = entries
     .map((entry, index) => entry.target === request.target && entry.content.includes(oldText) ? index : -1)
     .filter(index => index >= 0)
+  const exactMatches = substringMatches.filter(index => entries[index]!.content === oldText)
+  // Full entry content takes precedence, but duplicate exact entries remain ambiguous.
+  const matches = exactMatches.length > 0 ? exactMatches : substringMatches
   if (matches.length === 0) throw new Error(`No ${request.target} entry contains ${JSON.stringify(oldText)}.`)
   if (matches.length > 1) throw new Error(`Multiple ${request.target} entries contain ${JSON.stringify(oldText)}; use a unique substring.`)
   const index = matches[0]!
@@ -294,12 +293,15 @@ function compactionCandidates(
   now: string,
 ): RuntimeMemoryEntry[] {
   const seen = new Set<string>()
+  const existingByContent = new Map<string, RuntimeMemoryEntry>()
+  // Preserve find()'s first match, including legacy duplicates with different scopes.
+  for (const entry of existing) if (!existingByContent.has(entry.content)) existingByContent.set(entry.content, entry)
   return compacted.map((entry): RuntimeMemoryEntry => {
     const content = normalizeContent(entry.content, 'compacted content')
     if (!isImportance(entry.importance)) throw new Error('compacted importance must be critical, normal, or low')
     if (seen.has(content)) throw new Error('compacted runtime memory contains duplicate entries')
     seen.add(content)
-    const unchanged = existing.find(current => current.content === content)
+    const unchanged = existingByContent.get(content)
     // A compactor that drops the scope inherits it from the identical committed entry, so branch
     // visibility can never be silently widened by maintenance.
     const inheritedBranches = entry.branches ?? unchanged?.branches
@@ -319,16 +321,21 @@ function packCompactionCandidates(
   target: RuntimeMemoryTarget,
   maxBytes: number,
 ): RuntimeMemoryEntry[] {
-  const priority: Record<RuntimeMemoryImportance, number> = { critical: 0, normal: 1, low: 2 }
-  const ranked = replacements.map((entry, index) => ({ entry, index })).sort((left, right) => (
-    priority[left.entry.importance] - priority[right.entry.importance] || left.index - right.index
-  ))
+  const ranked: Record<RuntimeMemoryImportance, number[]> = { critical: [], normal: [], low: [] }
+  replacements.forEach((entry, index) => ranked[entry.importance].push(index))
   const selected = new Set<number>()
-  const packed: RuntimeMemoryEntry[] = []
-  for (const candidate of ranked) {
-    if (byteCount([...packed, candidate.entry], target) > maxBytes) continue
-    packed.push(candidate.entry)
-    selected.add(candidate.index)
+  const delimiterBytes = Buffer.byteLength(RUNTIME_ENTRY_DELIMITER, 'utf8')
+  let used = 0
+  let count = 0
+  // Three stable buckets preserve priority and original order without sorting.
+  for (const importance of ['critical', 'normal', 'low'] as const) for (const index of ranked[importance]) {
+    const entry = replacements[index]!
+    const matchesTarget = entry.target === target
+    const added = matchesTarget ? Buffer.byteLength(entry.content, 'utf8') + (count === 0 ? 0 : delimiterBytes) : 0
+    if (used + added > maxBytes) continue
+    used += added
+    if (matchesTarget) count += 1
+    selected.add(index)
   }
   return replacements.filter((_, index) => selected.has(index))
 }
@@ -340,7 +347,7 @@ function sleepSync(milliseconds: number): void {
 
 /**
  * Single authority for hot memory. JSON is the durable source of truth;
- * Markdown files are deterministic projections consumed by prompt assembly.
+ * Markdown files retain plain content; prompt projections add recorded metadata.
  */
 export class RuntimeMemoryController {
   readonly directory: string
@@ -394,10 +401,6 @@ export class RuntimeMemoryController {
     })
   }
 
-  contextText(branch?: string): string {
-    return this.contextProjection(branch).text
-  }
-
   /**
    * Read the exact Runtime revision and its prompt projection from each
    * configured authority root.
@@ -407,8 +410,9 @@ export class RuntimeMemoryController {
    */
   contextProjection(branch?: string): RuntimeMemoryContextProjection {
     const branchScope = scopeBranch(branch)
-    const local = this.localContextProjection(branchScope)
-    const global = this.userController?.localContextProjection()
+    const projectedAt = this.now().getTime()
+    const local = this.localContextProjection(projectedAt, branchScope)
+    const global = this.userController?.localContextProjection(projectedAt)
     const user = global?.user ?? local.user
     const memory = local.memory
     const entries = global === undefined
@@ -425,7 +429,7 @@ export class RuntimeMemoryController {
           directory: this.directory,
           sourcePath: this.sourcePath,
           revision: revision({ version: RUNTIME_MEMORY_VERSION, entries }),
-          generatedAt: this.now().toISOString(),
+          generatedAt: new Date(projectedAt).toISOString(),
           entries,
           targets: {
             memory: { ...visibleMemory, markdownPath: this.memoryPath },
@@ -446,6 +450,7 @@ export class RuntimeMemoryController {
       totalEntries: entries.length,
       text: `MNEMON RUNTIME MEMORY SNAPSHOT
 Revision: ${snapshot.revision}${branchLine}
+Metadata lines are annotations; created/updated are ages at projection in whole days (future/unknown for future/invalid timestamps). Current instructions win. For old_text/oldText, use entry content only.
 
 Contents of USER.md (user profile; entries: ${visibleUser.entryCount}; UTF-8 bytes: ${storeUser.used}/${storeUser.limit})
 <runtime-memory-file name="USER.md">
@@ -459,7 +464,7 @@ ${memory || '(empty)'}
     }
   }
 
-  private localContextProjection(branch?: string): { snapshot: RuntimeMemorySnapshot; user: string; memory: string; hidden: number } {
+  private localContextProjection(projectedAt: number, branch?: string): { snapshot: RuntimeMemorySnapshot; user: string; memory: string; hidden: number } {
     const branchScope = scopeBranch(branch)
     return this.withLock(() => {
       const file = this.readSource()
@@ -473,15 +478,15 @@ ${memory || '(empty)'}
           directory: this.directory,
           sourcePath: this.sourcePath,
           revision: revision(file),
-          generatedAt: this.now().toISOString(),
+          generatedAt: new Date(projectedAt).toISOString(),
           entries,
           targets: {
             memory: this.targetView(visible, 'memory'),
             user: this.targetView(visible, 'user'),
           },
         } satisfies RuntimeMemorySnapshot,
-        user: readFileSync(this.localUserPath, 'utf8').trimEnd(),
-        memory: branchScope === undefined ? readFileSync(this.memoryPath, 'utf8').trimEnd() : markdown(visible, 'memory').trimEnd(),
+        user: contextMarkdown(visible, 'user', projectedAt),
+        memory: contextMarkdown(visible, 'memory', projectedAt),
         hidden: branchScope === undefined ? 0 : entries.length - visible.length,
       }
     })
@@ -552,6 +557,8 @@ ${memory || '(empty)'}
       if (prepared.excludedEntry !== undefined && replacements.some(entry => entry.content === prepared.excludedEntry!.content)) {
         throw new Error('compacted runtime memory reintroduces the replaced or removed entry')
       }
+      // The worker supplies semantic candidates; deterministic packing owns exact
+      // UTF-8 accounting so the LLM never has to count bytes or delimiters.
       const fitted = packCompactionCandidates(replacements, request.target, compactedByteBudget)
       const targetEntries = [...fitted, ...(prepared.pendingEntry === undefined ? [] : [prepared.pendingEntry])]
       const entries = [...file.entries.filter(entry => entry.target !== request.target), ...targetEntries]
@@ -564,40 +571,6 @@ ${memory || '(empty)'}
     }))
     this.queue = operation.catch(() => undefined)
     return operation
-  }
-
-  /** Apply an LLM-produced compaction only to the exact snapshot it reviewed. */
-  compactTarget(
-    expectedRevision: string,
-    target: RuntimeMemoryTarget,
-    compacted: RuntimeMemoryCompactedEntry[],
-    maxBytes?: number,
-  ): Promise<RuntimeMemorySnapshot> {
-    if (target === 'user' && this.userController !== undefined) {
-      return this.userController.compactTarget(expectedRevision, target, compacted, maxBytes).then(() => this.snapshot())
-    }
-    const operation = this.queue.then(() => this.withLock(() => {
-      const file = this.readSource()
-      const beforeRevision = revision(file)
-      if (beforeRevision !== expectedRevision) throw new RuntimeMemoryConflictError()
-      const byteBudget = maxBytes ?? this.limits[target]
-      if (!Number.isInteger(byteBudget) || byteBudget < 0 || byteBudget > this.limits[target]) throw new Error('compaction byte budget is invalid')
-      const now = this.now().toISOString()
-      const existing = file.entries.filter(entry => entry.target === target)
-      const replacements = compactionCandidates(compacted, existing, target, now)
-      // The worker supplies semantic candidates; deterministic packing owns exact
-      // UTF-8 accounting so the LLM never has to count bytes or delimiters.
-      const fitted = packCompactionCandidates(replacements, target, byteBudget)
-      const entries = [...file.entries.filter(entry => entry.target !== target), ...fitted]
-      const used = byteCount(entries, target)
-      const limit = this.limits[target]
-      if (used > limit) throw new RuntimeMemoryCapacityError(target, byteCount(file.entries, target), used, limit)
-      this.persist({ version: RUNTIME_MEMORY_VERSION, entries })
-      const snapshot = this.snapshotUnlocked({ version: RUNTIME_MEMORY_VERSION, entries })
-      return snapshot
-    }))
-    this.queue = operation.catch(() => undefined)
-    return this.userController === undefined ? operation : operation.then(() => this.snapshot())
   }
 
   private initialize(): void {

@@ -4,6 +4,7 @@ import type { HostConnectionHandle, HostRpcHandler } from '../src/host/dsh.ts'
 import type { MnemonLifecycle } from '../src/host/lifecycle.ts'
 import { createActivationHandler, createPackHandler, createReadHandler, createWriteHandler, MNEMON_ACTIVATION_CHANNEL, MNEMON_PACK_CHANNEL, MNEMON_READ_CHANNEL, MNEMON_WRITE_CHANNEL, registerRpc } from '../src/host/rpc.ts'
 import type { LiveMnemonRuntime, MnemonRuntimeGraph } from '../src/host/runtime.ts'
+import { MnemonSubagentCoordinator } from '../src/host/subagent.ts'
 import type { VersionUpdateManager } from '../src/host/version-updates.ts'
 import { compositionFixture } from './fixtures/composition.ts'
 import openviking from 'dsh-mnemon-provider-openviking'
@@ -37,6 +38,8 @@ function protocolFixture(options: Config = {}) {
       role: type, availability: 'ready', revision: 'r1', capabilities: ['status'], management: { label: type, description: type },
     })) })),
     executeManagement: vi.fn(async (_request: unknown) => ({ revision: 'r2', value: {} })),
+    sourceInstances: () => ['runtime', 'documents', 'memory-spaces'].map(type => ({ sourceInstanceKey: 'source:mnemon-source-' + type, sourceTypeId: type })),
+    strategy: { definition: { manifest: { typeId: 'default-three-tier' } } },
   }
   const release = vi.fn()
   const graph = {
@@ -53,7 +56,7 @@ function protocolFixture(options: Config = {}) {
   }
   const route = {
     graph, selectedWorkspace: { id: 'workspace', title: 'Fixture', path: '/fixture/workspace' },
-    selectedRoot: '/fixture/data', effectiveRoot: '/fixture/data', aligned: true,
+    selectedRoot: '/fixture/data', effectiveRoot: '/fixture/data', aligned: true, liveSession: true,
   }
   const runtime = { config: graph.config, route: vi.fn(() => route) } as unknown as LiveMnemonRuntime
   return { runtime, graph, route, sources, generation, release }
@@ -94,6 +97,19 @@ describe('Mnemon RPC Source boundaries', () => {
     expect(await read('source-management-read', { sourceInstanceKey: 'source:missing', operation: 'snapshot' })).toMatchObject({ ok: false })
   })
 
+  it('refuses management and assistance on a memory layer that is off', async () => {
+    const f = protocolFixture({ memoryTopology: { layers: { documents: { enabled: false } } } } as Config)
+    const read = createReadHandler(f.runtime)
+    const write = createWriteHandler(f.runtime, lifecycle({ manageSource: vi.fn() }))
+    const off = { ok: false, error: { message: 'Memory layer documents is off; turn it on to read or change it' } }
+    expect(await read('source-management-read', { sourceInstanceKey: 'source:mnemon-source-documents', operation: 'snapshot' })).toMatchObject(off)
+    expect(await write('source-management-mutate', { sourceInstanceKey: 'source:mnemon-source-documents', operation: 'mutate', input: {}, expectedRevision: 'r1', confirmed: true })).toMatchObject(off)
+    expect(await write('source-assistance', { sourceInstanceKey: 'source:mnemon-source-documents', operation: 'mutate', input: {}, expectedRevision: 'r1', confirmed: true })).toMatchObject(off)
+    expect(f.generation.executeManagement).not.toHaveBeenCalled()
+    // Another layer stays usable.
+    expect(await read('source-management-read', { sourceInstanceKey: 'source:mnemon-source-runtime', operation: 'snapshot' })).toMatchObject({ ok: true })
+  })
+
   it('keeps the Runtime UX and validates branch input in the owning Source', async () => {
     const f = await fixture()
     const write = createWriteHandler(f.live)
@@ -105,7 +121,8 @@ describe('Mnemon RPC Source boundaries', () => {
 
   it('preserves explicit empty branch scope through Host assistance without a session', async () => {
     const f = await fixture()
-    const write = createWriteHandler(f.live, lifecycle())
+    const coordinator = new MnemonSubagentCoordinator({} as never, f.live)
+    const write = createWriteHandler(f.live, lifecycle({ manageSource: coordinator.manageSource.bind(coordinator) }))
     const sourceInstanceKey = 'source:mnemon-source-runtime'
     const assist = async (input: unknown) => {
       const sources = await f.graph.memoryComposition.current()!.managementCatalog({ storage: 'custom' })
@@ -204,16 +221,22 @@ describe('Host assistance and channels', () => {
     expect(await createWriteHandler(f.runtime, lifecycle())('source-assistance', { sourceInstanceKey: 'source:mnemon-source-runtime', operation: 'mutate', input: {}, expectedRevision: 'old', confirmed: true })).toMatchObject({ ok: false })
   })
 
-  it('routes Runtime semantic writes through the bound Agent, direct writes through the inspected Source', async () => {
+  it('routes all Runtime writes through the selected scope, independently of session alignment', async () => {
     const f = protocolFixture()
-    const mutate = vi.fn(async () => ({ success: true }))
-    const write = createWriteHandler(f.runtime, lifecycle({ runtime: mutate }))
+    Object.assign(f.sources.runtime!, { identity: async () => ({ sourceInstanceKey: 'source:mnemon-source-runtime' }) })
+    Object.assign(f.generation, { managementRevision: async () => 'r1' })
+    const mutate = vi.fn(async () => ({ revision: 'r2', value: { success: true } }))
+    const write = createWriteHandler(f.runtime, lifecycle({ manageSource: mutate }))
     await write('runtime-memory', { sessionId: 's1', action: 'replace', target: 'memory', old_text: 'before', content: 'after' })
-    expect(mutate).toHaveBeenCalledWith('s1', expect.objectContaining({ oldText: 'before', content: 'after' }), undefined)
+    expect(mutate).toHaveBeenCalledWith(f.graph, expect.objectContaining({
+      scope: expect.objectContaining({ workspaceId: '/fixture/workspace', sessionId: 's1' }),
+      input: expect.objectContaining({ oldText: 'before', content: 'after' }), expectedRevision: 'r1', confirmed: true,
+    }))
     f.route.aligned = false
     await write('runtime-memory', { sessionId: 's1', action: 'add', target: 'memory', content: 'inspect' })
-    expect(f.sources.runtime!.mutate).toHaveBeenCalledWith('mutate', expect.objectContaining({ content: 'inspect' }), undefined)
-    expect(mutate).toHaveBeenCalledOnce()
+    expect(mutate).toHaveBeenLastCalledWith(f.graph, expect.objectContaining({ input: expect.objectContaining({ content: 'inspect' }) }))
+    expect(f.sources.runtime!.mutate).not.toHaveBeenCalled()
+    expect(mutate).toHaveBeenCalledTimes(2)
   })
 
   it('keeps Tab reads deterministic while delegating semantic writes', async () => {
@@ -231,6 +254,53 @@ describe('Host assistance and channels', () => {
     f.route.aligned = false
     await createWriteHandler(f.runtime, life)('remember', { sessionId: 's1', content: 'inspected' })
     expect(f.sources['memory-spaces']!.mutate).toHaveBeenCalledWith('remember', expect.objectContaining({ content: 'inspected', source: 'user' }), undefined)
+  })
+
+  it('writes to the Sources directly for a session whose Agent is not loaded', async () => {
+    // A conversation opened from the list, or just switched to, before DSH loads its Agent.
+    const f = protocolFixture()
+    Object.assign(f.route, { liveSession: false })
+    const remember = vi.fn()
+    const mutateDocument = vi.fn()
+    const write = createWriteHandler(f.runtime, lifecycle({ remember, mutateDocument }))
+    expect(await write('remember', { sessionId: 's1', content: 'Prefer pnpm.' })).toMatchObject({ ok: true })
+    expect(f.sources['memory-spaces']!.mutate).toHaveBeenCalledWith('remember', expect.objectContaining({ content: 'Prefer pnpm.', source: 'user' }), undefined)
+    expect(await write('document', { sessionId: 's1', action: 'create', title: 'Boot', content: '# Boot' })).toMatchObject({ ok: true })
+    expect(f.sources.documents!.mutate).toHaveBeenCalledWith('mutate', expect.objectContaining({ action: 'create', title: 'Boot' }), undefined)
+    expect(remember).not.toHaveBeenCalled()
+    expect(mutateDocument).not.toHaveBeenCalled()
+  })
+
+  it('makes room for a Document through a task Agent when the session\'s Agent is not loaded', async () => {
+    const f = protocolFixture()
+    Object.assign(f.route, { liveSession: false })
+    const capacity = Object.assign(new Error('Would exceed active document capacity: 11 bytes (limit 10). Archive the least-recently-used active document before retrying.'), { code: 'document-capacity', candidates: [{ id: 'old' }] })
+    const mutateDocumentTask = vi.fn(async () => ({ action: 'created', document: { id: 'new' } }))
+    const write = createWriteHandler(f.runtime, lifecycle({ mutateDocumentTask }))
+    f.sources.documents!.mutate.mockRejectedValueOnce(capacity)
+    expect(await write('document', { sessionId: 's1', action: 'create', title: 'Boot', content: '# Boot' })).toMatchObject({ ok: true })
+    // The task Agent archives the least recently used Document, as a loaded Agent does.
+    expect(mutateDocumentTask).toHaveBeenCalledWith('s1', expect.objectContaining({ action: 'create', title: 'Boot' }), '/fixture/workspace', undefined)
+    // Other failures, and a page without a conversation, keep the Source's answer.
+    f.sources.documents!.mutate.mockRejectedValueOnce(new Error('document not found: x'))
+    expect(await write('document', { sessionId: 's1', action: 'update', id: 'x', content: '# X' })).toMatchObject({ ok: false, error: { message: 'document not found: x' } })
+    f.sources.documents!.mutate.mockRejectedValueOnce(capacity)
+    expect(await write('document', { action: 'create', title: 'Boot', content: '# Boot' })).toMatchObject({ ok: false, error: { message: expect.stringContaining('Would exceed active document capacity') } })
+    expect(mutateDocumentTask).toHaveBeenCalledOnce()
+  })
+
+  it('chooses a new Memory Space\'s Provider through a task Agent when the session\'s Agent is not loaded', async () => {
+    const f = protocolFixture()
+    Object.assign(f.route, { liveSession: false })
+    const decision = { providerId: 'mnemon-native', reason: 'local', confidence: 'high' }
+    const placeProvider = vi.fn()
+    const placeProviderTask = vi.fn(async () => decision)
+    const write = createWriteHandler(f.runtime, lifecycle({ placeProvider, placeProviderTask }))
+    const request = { sessionId: 's1', name: 'Product', description: 'Decisions', placement: { mode: 'automatic', prompt: 'local first' } }
+    expect(await write('body-create', request)).toMatchObject({ ok: true })
+    expect(placeProviderTask).toHaveBeenCalledWith('s1', { name: 'Product', description: 'Decisions' }, expect.objectContaining({ selectorBrief: 'eligible providers' }), '/fixture/workspace', undefined)
+    expect(placeProvider).not.toHaveBeenCalled()
+    expect(f.sources['memory-spaces']!.mutate).toHaveBeenCalledWith('body-create', { request, placementDecision: decision }, undefined)
   })
 
   it('synthesizes answers only after deterministic Source search and honors cancellation', async () => {
@@ -295,9 +365,25 @@ describe('Host assistance and channels', () => {
     f.route.aligned = false
     f.route.effectiveRoot = '/fixture/other'
     expect(await createReadHandler(f.runtime, lifecycle())('status-summary', { sessionId: 's1' })).toMatchObject({ ok: true, value: {
-      healthy: true, lifecycle: { enabled: true }, memorySystem: { evaluation: { state: 'ready' } },
+      healthy: true, lifecycle: { enabled: true }, memorySystem: { strategyTypeId: 'default-three-tier', evaluation: { state: 'ready' } },
       workspaceContext: { aligned: false, selectedRoot: '/fixture/data', effectiveRoot: '/fixture/other' },
     } })
+  })
+
+  it('names the running version and an installed update in the status every page reads', async () => {
+    const f = protocolFixture()
+    const restartStatus = vi.fn(() => ({ running: '0.5.22', installed: '0.5.23' }))
+    const versions = { runningVersion: '0.5.22', currentDshMnemonVersion: '0.5.23', restartStatus } as unknown as VersionUpdateManager
+    expect(await createReadHandler(f.runtime, lifecycle(), versions)('status-summary', { sessionId: 's1' })).toMatchObject({ ok: true, value: {
+      dshMnemonVersion: '0.5.22', restartPending: { running: '0.5.22', installed: '0.5.23' },
+    } })
+    restartStatus.mockReturnValue(undefined as never)
+    const current = await createReadHandler(f.runtime, lifecycle(), versions)('status', {})
+    expect(current).toMatchObject({ ok: true, value: { dshMnemonVersion: '0.5.22' } })
+    expect((current as { value: Record<string, unknown> }).value).not.toHaveProperty('restartPending')
+    // The reminder is optional; a failure to read it never fails the status.
+    restartStatus.mockImplementation(() => { throw new Error('unreadable profile') })
+    expect(await createReadHandler(f.runtime, lifecycle(), versions)('status', {})).toMatchObject({ ok: true, value: { healthy: true } })
   })
 
   it('keeps activation strictly narrower than the configuration/mutation channel', async () => {
@@ -327,23 +413,14 @@ describe('Host assistance and channels', () => {
     const handle = vi.fn()
     registerRpc({ rpc: { handle } } as unknown as HostConnectionHandle, f.runtime)
     expect(handle).toHaveBeenCalledTimes(4)
-    expect(handle).toHaveBeenCalledWith(MNEMON_READ_CHANNEL, expect.any(Function), { authority: 'trusted-host' })
-    expect(handle).toHaveBeenCalledWith(MNEMON_ACTIVATION_CHANNEL, expect.any(Function), { authority: 'trusted-host' })
-    expect(handle).toHaveBeenCalledWith(MNEMON_WRITE_CHANNEL, expect.any(Function), { authority: 'loopback' })
-    expect(handle).toHaveBeenCalledWith(MNEMON_PACK_CHANNEL, expect.any(Function), { authority: 'loopback' })
+    for (const channel of [MNEMON_READ_CHANNEL, MNEMON_ACTIVATION_CHANNEL, MNEMON_WRITE_CHANNEL, MNEMON_PACK_CHANNEL]) {
+      expect(handle).toHaveBeenCalledWith(channel, expect.any(Function))
+    }
     for (const channel of [MNEMON_WRITE_CHANNEL, MNEMON_ACTIVATION_CHANNEL]) {
       const handler = handle.mock.calls.find(([id]) => id === channel)![1] as HostRpcHandler
       expect(await handler(channel === MNEMON_WRITE_CHANNEL ? 'remember' : 'body', { content: 'blocked', memoryBodyId: 'project', active: false })).toMatchObject({ ok: false })
     }
     expect(f.sources['memory-spaces']!.mutate).not.toHaveBeenCalled()
-  })
-
-  it('supports explicitly selected trusted-host management without a parallel RPC implementation', () => {
-    const f = protocolFixture()
-    const handle = vi.fn()
-    registerRpc({ rpc: { handle } } as unknown as HostConnectionHandle, f.runtime, undefined, undefined, 'trusted-host')
-    expect(handle).toHaveBeenCalledWith(MNEMON_WRITE_CHANNEL, expect.any(Function), { authority: 'trusted-host' })
-    expect(handle).toHaveBeenCalledWith(MNEMON_PACK_CHANNEL, expect.any(Function), { authority: 'trusted-host' })
   })
 
   it('keeps Pack transport authenticated, selected-root scoped, and merge-only from the page', async () => {

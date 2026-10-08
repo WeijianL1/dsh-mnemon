@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 import { MemoryCompositionRunner, type MemoryTestTurn } from 'dsh-mnemon/testing'
@@ -11,6 +11,7 @@ import * as threeTier from 'dsh-mnemon-strategy-default-three-tier'
 import * as scoped from 'dsh-mnemon-strategy-scoped'
 import * as light from 'dsh-mnemon-strategy-light-context'
 import * as capture from 'dsh-mnemon-strategy-auto-capture'
+import * as general from 'dsh-mnemon-strategy-general'
 import * as notes from '../lib/external-source.js'
 import * as focus from '../lib/external-strategy.js'
 import * as externalBudget from '../lib/external-strategy-extension.js'
@@ -65,15 +66,46 @@ describe('external consumer of packed artifacts', () => {
     } finally { turns.forEach(turn => turn.release()); await runner.dispose(); rmSync(directory, { recursive: true, force: true }) }
   })
 
+  it('applies a packed enhancement to the packed general main Strategy', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'external-general-strategy-'))
+    const runner = new MemoryCompositionRunner({ strategyTypeId: 'general' })
+    const turns: MemoryTestTurn[] = []
+    try {
+      await runner.mount(general, { instanceId: 'general' })
+      await runner.mount(light, { instanceId: 'light', config: { maxProjectionCharacters: 200 } })
+      await runner.mount(runtime, { instanceId: 'global', config: { dataDir: join(directory, 'global') } })
+      await (await runner.managementClient('source:global')).mutate('mutate',
+        { action: 'add', target: 'memory', content: 'General sentinel. '.repeat(100) }, { confirmed: true })
+      const turn = await runner.beginTurn()
+      turns.push(turn)
+      expect(turn.view.strategyTypeId).toBe('general')
+      expect(turn.view.strategyExtensions?.map(item => item.typeId)).toEqual(['light-context'])
+      expect(turn.view.guidance?.system).toContain('MNEMON GENERAL MEMORY PROTOCOL')
+      expect(turn.view.projection.filter(item => item.mode === 'eager').map(item => item.sourceInstanceKey)).toEqual(['source:global'])
+      expect(turn.view.projection.reduce((sum, item) => sum + item.text.length, 0)).toBeLessThanOrEqual(200)
+    } finally { turns.forEach(turn => turn.release()); await runner.dispose(); rmSync(directory, { recursive: true, force: true }) }
+  })
+
   it('imports every declared Node entry from installed packages, not repository sources', async () => {
     const names: string[] = JSON.parse(readFileSync(new URL('../artifacts.json', import.meta.url), 'utf8'))
     const require = createRequire(import.meta.url)
-    expect(names).toHaveLength(17)
+    expect(names).toHaveLength(18)
     for (const name of names) {
       const manifest = JSON.parse(readFileSync(require.resolve(name + '/package.json'), 'utf8'))
       for (const subpath of Object.keys(manifest.exports)) {
         if (subpath === './client' || subpath === './package.json') continue
         const specifier = name + (subpath === '.' ? '' : subpath.slice(1))
+        if (subpath === './locale/*.json') {
+          const directory = join(dirname(require.resolve(name + '/package.json')), 'locale')
+          const files = readdirSync(directory).filter(file => file.endsWith('.json'))
+          expect(files).toContain('en.json')
+          for (const file of files) {
+            const resolved = require.resolve(name + '/locale/' + file)
+            expect(resolved).toBe(join(directory, file))
+            expect(JSON.parse(readFileSync(resolved, 'utf8'))).toEqual(expect.any(Object))
+          }
+          continue
+        }
         if (subpath.startsWith('./presentation/')) {
           const asset = readFileSync(require.resolve(specifier), 'utf8')
           if (subpath.endsWith('.json')) expect(Object.keys(JSON.parse(asset)).sort()).toEqual(['en', 'zh'])
@@ -83,6 +115,18 @@ describe('external consumer of packed artifacts', () => {
         expect(Object.keys(await import(specifier)).length, specifier).toBeGreaterThan(0)
       }
     }
+  })
+
+  it('ships Chinese plugin metadata and keeps manifest fallback for English', () => {
+    const require = createRequire(import.meta.url)
+    const english = JSON.parse(readFileSync(require.resolve('dsh-mnemon/locale/en.json'), 'utf8'))
+    const chinese = JSON.parse(readFileSync(require.resolve('dsh-mnemon/locale/zh.json'), 'utf8'))
+    const manifest = JSON.parse(readFileSync(require.resolve('dsh-mnemon/package.json'), 'utf8'))
+    expect(english.meta).toEqual({})
+    expect(manifest.name).toBe('dsh-mnemon')
+    expect(manifest.description).toMatch(/Composable, view-based memory/)
+    expect(chinese.meta.title).toBe('可组合记忆 (dsh-mnemon)')
+    expect(chinese.meta.description).toMatch(/可组合视图记忆/)
   })
 
   it('supports a new Source and Strategy, authority checks, exact grants and explicit replacement', async () => {

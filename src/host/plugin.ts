@@ -1,8 +1,9 @@
-import { Config, InteractionConfig, resolveConfig, resolveInteractionConfig, type Config as MnemonConfig } from './config.ts'
+import { Context } from '@deepseek-ai/cordis'
+import { Config as PlainConfig, InteractionConfig, resolveConfig, resolveInteractionConfig, type Config as MnemonConfig } from './config.ts'
 import { registerCommands } from './commands.ts'
 import type { HostContextShape, HostWorkspaceRegistry } from './dsh.ts'
 import { registerGuidance } from './guidance.ts'
-import { createRuntimeGraph, LiveMnemonRuntime, type MnemonRuntimeGraph } from './runtime.ts'
+import { createRuntimeGraph, LiveMnemonRuntime } from './runtime.ts'
 import { MnemonLifecycle } from './lifecycle.ts'
 import { registerRpc } from './rpc.ts'
 import { migrateLegacyDisplayMode, registerSettingsRpc } from './settings.ts'
@@ -13,11 +14,15 @@ import { provideMemoryRuntime } from '../core/runtime.ts'
 import { MemoryPluginManagement } from './plugin-management.ts'
 import { registerViewRpc } from './view-rpc.ts'
 import { MemoryPluginInstallation } from './plugin-installation.ts'
+import { MnemonRemoteService } from './remote-rpc.ts'
+import { plainHostConfig, type LiveHostConfig } from './live-config.ts'
+import { ProfileMnemonSettings } from './settings-service.ts'
+import { VersionUpdateManager, type DshBundleInstaller } from './version-updates.ts'
 
 export const name = 'dsh-mnemon'
 export const provide = ['mnemonMemory']
 export const inject = ['tools', 'settings', 'commands', 'agents', 'subagents']
-export { Config }
+export { LiveConfig as Config } from './live-config.ts'
 export type { MnemonConfig }
 
 /** Resolve the optional Web workspace service at call time, not plugin-mount time. */
@@ -30,52 +35,34 @@ function optionalWorkspaceRegistry(ctx: HostContextShape): HostWorkspaceRegistry
 }
 
 /** DSH owns assembly; this Host only wires scope, phases and user preferences. */
-export function apply(rawContext: unknown, config: MnemonConfig = {}): void {
+export function apply(rawContext: unknown, rawConfig: MnemonConfig | LiveHostConfig = {}): void {
   const ctx = rawContext as unknown as HostContextShape
+  const config = plainHostConfig(rawConfig)
+  const hostSettings = new ProfileMnemonSettings(ctx, rawConfig)
   registerMnemonSubagentTokenUsageProjection(ctx)
   const extensions = provideMemoryRuntime(ctx)
-  const memoryPlugins = new MemoryPluginManagement(ctx, extensions)
+  const memoryPlugins = new MemoryPluginManagement(ctx, extensions, hostSettings)
   const pluginInstallation = new MemoryPluginInstallation(ctx)
-  const effectiveConfig = (value: Config) => memoryPlugins.resolveConfig(resolveConfig(value))
-  const prepared = new Map<object, { graph: MnemonRuntimeGraph; token: symbol }>()
-  const disposePrepared = (): void => {
-    for (const candidate of prepared.values()) candidate.graph.dispose()
-    prepared.clear()
-  }
-  const settings = ctx.settings.register<Config>('mnemon', Config, {
+  const effectiveConfig = (value: MnemonConfig) => memoryPlugins.resolveConfig(resolveConfig(value), value.memoryView ?? { entries: {} })
+  const settings = hostSettings.register<MnemonConfig>('mnemon', PlainConfig, {
     base: config,
     applies: 'live',
-    validate: value => {
-      disposePrepared()
-      const candidate = { graph: createRuntimeGraph(effectiveConfig(value), undefined, extensions), token: Symbol('prepared-runtime') }
-      prepared.set(value, candidate)
-      // Settings commits synchronously after validation. A standalone/cancelled
-      // validation has no commit event, so retire its attached graph next tick.
-      queueMicrotask(() => {
-        if (prepared.get(value)?.token !== candidate.token) return
-        prepared.delete(value)
-        candidate.graph.dispose()
-      })
-    },
+    // Profile writes commit asynchronously. Check that the candidate composes
+    // now, then build from the committed live references on volatile-update.
+    validate: value => createRuntimeGraph(effectiveConfig(value), undefined, extensions).dispose(),
   })
-  const initialSettings = settings.get()
-  const initialCandidate = prepared.get(initialSettings)
-  if (initialCandidate !== undefined) prepared.delete(initialSettings)
-  const runtime = new LiveMnemonRuntime(initialCandidate?.graph ?? createRuntimeGraph(effectiveConfig(initialSettings), undefined, extensions), optionalWorkspaceRegistry(ctx), ctx.agents, extensions)
+  const runtime = new LiveMnemonRuntime(createRuntimeGraph(effectiveConfig(settings.get()), undefined, extensions), optionalWorkspaceRegistry(ctx), ctx.agents, extensions)
   const resolved = runtime.config
-  ctx.on('settings/updated', ((namespace: string, next: Config) => {
+  ctx.effect(() => hostSettings.onUpdated((namespace, value) => {
     if (namespace === memoryPlugins.settingsNamespace) {
       runtime.swap(createRuntimeGraph(effectiveConfig(settings.get()), undefined, extensions))
       return
     }
     if (namespace !== 'mnemon') return
-    const candidate = prepared.get(next)
-    if (candidate !== undefined) prepared.delete(next)
-    disposePrepared()
-    runtime.swap(candidate?.graph ?? createRuntimeGraph(effectiveConfig(next), undefined, extensions))
-  }) as never)
+    runtime.swap(createRuntimeGraph(effectiveConfig(value as MnemonConfig), undefined, extensions))
+  }), 'dsh-mnemon: live runtime settings')
   ctx.effect(() => memoryPlugins.start(), 'dsh-mnemon: plugin graph settings')
-  ctx.settings.register('mnemon-ui', InteractionConfig, {
+  hostSettings.register('mnemon-ui', InteractionConfig, {
     base: resolveInteractionConfig(resolved.conversationInteraction),
     applies: 'live',
   })
@@ -83,7 +70,7 @@ export function apply(rawContext: unknown, config: MnemonConfig = {}): void {
     let disposed = false
     const migrate = (): void => {
       if (disposed) return
-      void migrateLegacyDisplayMode(ctx.settings).catch(error => {
+      void migrateLegacyDisplayMode(hostSettings).catch(error => {
         console.warn('dsh-mnemon: could not persist the builtin displayMode migration', error)
       })
     }
@@ -93,36 +80,69 @@ export function apply(rawContext: unknown, config: MnemonConfig = {}): void {
     migrate()
     return () => { disposed = true; unsubscribe() }
   }, 'dsh-mnemon: canonical displayMode migration')
-  const coordinator = new MnemonSubagentCoordinator(ctx.subagents, runtime, ctx, () => {
+  ctx.effect(() => {
+    let disposed = false
+    const loader = ctx.get('loader') as { await?(): Promise<unknown> } | undefined
+    void Promise.resolve(loader?.await?.()).then(async () => {
+      if (disposed) return
+      const catalog = await memoryPlugins.catalog()
+      if (disposed) return
+      await hostSettings.importLegacy(catalog.entries.filter(entry => entry.roles.includes('source')).map(entry => entry.entryId))
+    }).catch(error => { console.warn('dsh-mnemon: could not recover retained legacy settings', error) })
+    return () => { disposed = true }
+  }, 'dsh-mnemon: retained settings migration')
+  const coordinator: MnemonSubagentCoordinator = new MnemonSubagentCoordinator(ctx.subagents, runtime, ctx, () => {
     const taskAgentModel = runtime.config.taskAgentModel
     if (taskAgentModel.mode !== 'fixed') return undefined
     const provider = taskAgentModel.provider?.trim()
     const model = taskAgentModel.model?.trim()
     if (provider === undefined || provider === '' || model === undefined || model === '') return undefined
     return { provider, model }
-  }, () => runtime.config.runtimeMemory.maintenanceMaxTokens)
+  }, () => runtime.config.runtimeMemory.maintenanceMaxTokens,
+  (scope, signal, operation) => lifecycle.runRuntimeMaintenanceTask(scope, signal, operation))
   const lifecycle = new MnemonLifecycle(ctx, coordinator, runtime.config, runtime)
   ctx.effect(() => {
     const stop = lifecycle.start()
-    return () => {
+    return async () => {
       stop()
-      disposePrepared()
+      await coordinator.dispose()
       runtime.dispose()
     }
   }, 'dsh-mnemon.lifecycle-root()')
   registerTools(ctx, runtime, coordinator)
   registerCommands(ctx.commands, runtime, coordinator)
   registerGuidance(ctx, resolved)
-  ctx.inject(['connection'], (webContext) => {
+  ctx.inject(['connection', 'webServer'], (webContext) => {
     // `inject` guarantees the service at runtime; retain the defensive guard
     // because HostContextShape also models profiles where it is absent.
-    if (webContext.connection === undefined) return
-    // Keep one branch-free call shape across both supported DSH generations:
-    // rc.2 enforces this legacy channel authority, while 0.1.2-alpha.1 ignores
-    // the extra JavaScript argument and authenticates every Host API uniformly.
-    const managementAuthority = resolved.remoteAccess === 'trusted-host' ? 'trusted-host' : 'loopback'
-    registerRpc(webContext.connection, runtime, lifecycle, undefined, managementAuthority)
-    registerSettingsRpc(webContext.connection, ctx.settings, managementAuthority)
-    registerViewRpc(webContext.connection, runtime, extensions, memoryPlugins, lifecycle, managementAuthority, pluginInstallation)
+    // Connection's RPC getter keeps its provider's injection scope. Carry
+    // the explicitly injected server on our own Context so late registration
+    // works without changing or restarting the shared Connection plugin.
+    const connection = Context.is(webContext)
+      ? webContext.extend({ webServer: webContext.get('webServer') }).connection
+      : webContext.connection
+    if (connection === undefined) return
+    // The Starter updates through DSH's own plugin manager and profile, so a packaged
+    // app's bundled pnpm serves it where no pnpm is on PATH.
+    const versions = new VersionUpdateManager({
+      mnemonCliPath: () => runtime.config.cliPath,
+      bundleInstaller: () => ctx.get('pluginManager') as DshBundleInstaller | undefined,
+      runningProfile: () => {
+        const profile = ctx.get('profileContext') as { dir?: unknown; packageManager?: unknown } | undefined
+        return typeof profile?.dir === 'string' ? { dir: profile.dir, packageManager: profile.packageManager !== undefined } : undefined
+      },
+    })
+    const rpc = registerRpc(connection, runtime, lifecycle, versions)
+    const settings = registerSettingsRpc(connection, hostSettings)
+    const view = registerViewRpc(connection, runtime, extensions, memoryPlugins, lifecycle, pluginInstallation)
+    if (Context.is(webContext)) {
+      new MnemonRemoteService(webContext, {
+        ...rpc,
+        settings,
+        view: view.read,
+        viewWrite: view.write,
+        management: resolved.remoteAccess === 'trusted-host',
+      })
+    }
   })
 }

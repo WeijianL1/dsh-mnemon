@@ -1,0 +1,10 @@
+# Keep default credential scanning; permit one exact public artifact-hash line.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "SHA-256 of the public OpenViking verification report"
+condition = "AND"
+paths = ['^docs/pr-assets/issue-233-openviking-20260916/verification\.json$']
+regexTarget = "line"
+regexes = ['^\s*"real-openviking-auth-report\.json":\s*"[a-f0-9]{64}",?\s*$']
