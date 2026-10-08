@@ -12,13 +12,10 @@ import {
 } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import type { DocumentMutation, DocumentMutationResult, DocumentRecord, DocumentSearchResult, DocumentSnapshot, DocumentStatus, DocumentView } from './contracts.ts'
+import type { DocumentCapacityPlan, DocumentMutation, DocumentMutationResult, DocumentRecord, DocumentSearchResult, DocumentSnapshot, DocumentStatus, DocumentView } from './contracts.ts'
 import { lexicalRequiredMatchCount, lexicalSearchTokens } from './search-tokens.ts'
-
-export type { DocumentMutation, DocumentMutationResult, DocumentRecord, DocumentSearchResult, DocumentSnapshot, DocumentStatus, DocumentView } from './contracts.ts'
-
 import { DOCUMENTS_VERSION, DOCUMENTS_ACTIVE_LIMIT_BYTES } from './contracts.ts'
-export { DOCUMENTS_VERSION, DOCUMENTS_ACTIVE_LIMIT_BYTES } from './contracts.ts'
+
 const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 const LOCK_TIMEOUT_MS = 5_000
 const LOCK_STALE_MS = 30_000
@@ -29,9 +26,6 @@ interface DocumentIndex {
   version: typeof DOCUMENTS_VERSION
   documents: DocumentRecord[]
 }
-
-import type { DocumentCapacityPlan } from './contracts.ts'
-export type { DocumentCapacityPlan } from './contracts.ts'
 
 export class DocumentCapacityError extends Error {
   readonly code = 'document-capacity' as const
@@ -293,12 +287,12 @@ export class DocumentController {
             if (titleMatch || descriptionMatch || contentMatch) tokenMatches += 1
             score += titleMatch ? 4 : descriptionMatch ? 2 : contentMatch ? 1 : 0
           }
-          return { result: { ...view, score, excerpt: excerpt(view.content) }, tokenMatches }
+          return { result: { ...view, score }, tokenMatches }
         })
         .filter(candidate => normalized === '' || (candidate.result.score > 0 && candidate.tokenMatches >= requiredTokenMatches))
         .sort((left, right) => right.result.score - left.result.score || Date.parse(right.result.updatedAt) - Date.parse(left.result.updatedAt))
         .slice(0, limit)
-        .map(candidate => candidate.result)
+        .map(({ result }) => ({ ...result, excerpt: excerpt(result.content) }))
       if (ranked.length > 0) {
         const accessedAt = this.now().toISOString()
         const ids = new Set(ranked.map(result => result.id))
@@ -607,11 +601,5 @@ export class DocumentManager {
       this.controllers.set(key, controller)
     }
     return controller
-  }
-
-  forAgent(agent: { session: { header?: { cwd?: string } } }): DocumentController {
-    const cwd = agent.session.header?.cwd
-    if (cwd === undefined || cwd.trim() === '') throw new Error('the current DSH session has no workspace for Mnemon Documents')
-    return this.forWorkspace(cwd)
   }
 }

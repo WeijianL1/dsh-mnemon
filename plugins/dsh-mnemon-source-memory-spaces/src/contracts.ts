@@ -5,6 +5,7 @@
  * and persisted Document/Pack lineage; they all refer to memory spaces.
  */
 export type { MemoryJsonValue as JsonValue } from 'dsh-mnemon/contracts'
+import type { MemoryReadGrant } from 'dsh-mnemon/contracts'
 
 export type MemoryProviderId = string
 
@@ -29,7 +30,7 @@ export interface MemoryProviderConfigField {
   label: string
   /** Optional Host-provided translation key; clients fall back to label. */
   i18nKey?: string
-  /** Service fields are configured once in Settings; memory fields belong to each Memory Space. */
+  /** Service fields are configured once on the dsh-mnemon page under Plugins; memory fields belong to each Memory Space. */
   scope: 'service' | 'memory'
   /** A reusable local data location presented with the same default/custom scope UI as Mnemon Native. */
   role?: 'global-location'
@@ -74,6 +75,8 @@ export interface MemoryPersistenceStrategy {
 export interface ResolvedMemoryPersistenceStrategy {
   mode: 'manual' | 'automatic'
   providerId: MemoryProviderId
+  /** Set when no provider was chosen; manual mode then uses whichever provider is ready. */
+  providerDefaulted?: true
   prompt: string
   rules: {
     allowedProviderIds: MemoryProviderId[]
@@ -257,6 +260,14 @@ export const INTENTS = ['WHY', 'WHEN', 'ENTITY', 'GENERAL'] as const satisfies r
 
 export type RecallRelevanceTier = 'high' | 'medium' | 'low' | 'unknown'
 
+/**
+ * One spelling-insensitive key per entity. The Host's entity index and the Client's graph
+ * both count an entity's memories by it, so their numbers agree.
+ */
+export function normalizeEntityKey(entity: string): string {
+  return entity.normalize('NFKC').trim().toLocaleLowerCase()
+}
+
 export interface Insight {
   id: string
   content: string
@@ -330,6 +341,19 @@ export interface MemorySpaceView extends MemorySpace {
   stats?: MemorySpaceStats
 }
 
+/** Optional Host-only body-directory input; the Host binds the grant to its initiating View and exact Source. */
+export interface MemorySpaceWriteScopeRequest {
+  viewId: string
+  grant: MemoryReadGrant
+}
+
+/** Source-owned write authority, distinct from the active namespaces pinned for recall. */
+export interface MemorySpaceWriteScope {
+  viewId: string
+  sourceInstanceKey: string
+  memoryBodyIds: string[]
+}
+
 export interface MemorySpaceCatalog {
   items: MemorySpaceView[]
   providers: MemoryProviderDescriptor[]
@@ -339,6 +363,8 @@ export interface MemorySpaceCatalog {
   activeCount: number
   directory: string
   generatedAt: string
+  /** Present only when body-directory receives a supported writeScope request. Older Sources omit it. */
+  writeScope?: MemorySpaceWriteScope
 }
 
 export interface MemoryGraphNode extends Insight {
@@ -368,7 +394,8 @@ export interface MemoryGraphSnapshot {
 }
 
 export type MemoryReadMode = 'search' | 'graph' | 'projection' | 'enumerable' | 'query-only' | 'entities' | 'unsupported'
-export type MemoryReadStatus = 'ready' | 'empty' | 'query-required' | 'unsupported' | 'unavailable'
+/** 'loading' is client-only: a page shows its spaces from the directory while the read runs. */
+export type MemoryReadStatus = 'ready' | 'empty' | 'query-required' | 'unsupported' | 'unavailable' | 'loading'
 
 /**
  * One provider-backed Memory Space participating in a read surface.
@@ -387,6 +414,10 @@ export interface MemoryReadSource {
   status: MemoryReadStatus
   itemCount: number
   edgeCount?: number
+  /** Entity reads: the memories the entity index covers in this space. */
+  memoryCount?: number
+  /** Entity reads: false when the Provider could not index every memory of this space. */
+  complete?: boolean
   hint?: string
   quality?: RecallQualityStats
 }
@@ -540,12 +571,39 @@ export interface MemorySpacesStatus {
   stats?: MemorySpaceStats & { dbPath?: string }
 }
 
+/**
+ * The entities of the active spaces. Each count is the number of memories that
+ * carry the entity, the same set entity-memories lists.
+ */
 export interface EntityView {
   items: Array<{ entity: string; count: number }>
+  /** With a selected entity: the first page of entity-memories, kept for existing callers. */
   insights: Insight[]
   selected?: string
   /** Omitted only when talking to a pre-provider-aware Host. */
   sources?: MemoryReadSource[]
+  /** Distinct entities across the active spaces; items may be capped below it. Omitted by older Hosts. */
+  total?: number
+  /** False when a space's Provider could not index every memory. Omitted by older Hosts. */
+  complete?: boolean
+}
+
+/** One page of the memories that carry an entity, by importance and then recency. */
+export interface EntityMemoriesView {
+  /** The entity's most common spelling, or the requested name when no memory carries it. */
+  entity: string
+  total: number
+  offset: number
+  items: Insight[]
+  complete: boolean
+  sources: MemoryReadSource[]
+}
+
+/** Memories recall relates to an entity that do not carry it themselves. */
+export interface EntityRelatedView {
+  entity: string
+  items: Insight[]
+  sources: MemoryReadSource[]
 }
 
 // Published type spellings retained for independently installed v0.5.x consumers.

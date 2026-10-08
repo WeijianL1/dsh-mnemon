@@ -2,8 +2,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { RUNTIME_ENTRY_DELIMITER } from '../src/contracts.ts'
 import {
-  RUNTIME_ENTRY_DELIMITER,
   RuntimeMemoryCapacityError,
   RuntimeMemoryController,
 } from "../src/controller.ts"
@@ -79,12 +79,72 @@ describe('RuntimeMemoryController', () => {
     expect(controller.snapshot().entries).toEqual([])
   })
 
-  it('rejects ambiguous substring mutations without changing the source', async () => {
+  it.each([
+    ['memory', 'remove'], ['memory', 'replace'], ['user', 'remove'], ['user', 'replace'],
+  ] as const)('prefers an exact %s entry for %s over other substring matches', async (target, action) => {
+    const now = new Date('2026-08-13T08:00:00.000Z')
+    const { directory, controller } = fixture(now)
+    const otherTarget = target === 'memory' ? 'user' : 'memory'
+    await controller.mutate({ action: 'add', target, content: 'EGO_LINUX_CHROME' })
+    await controller.mutate({ action: 'add', target, content: 'X', importance: 'critical', ...(target === 'memory' ? { branches: ['main'] } : {}) })
+    await controller.mutate({ action: 'add', target: otherTarget, content: 'X' })
+    const before = controller.snapshot()
+    now.setTime(Date.parse('2026-08-14T08:00:00.000Z'))
+
+    const result = await controller.mutate({ action, target, oldText: ' \nX\t ', ...(action === 'replace' ? { content: 'Y' } : {}) })
+    expect(result).toMatchObject(action === 'remove'
+      ? { removed: 'X', entryCount: 1 }
+      : { replaced: { from: 'X', to: 'Y' }, entryCount: 2 })
+    const entries = controller.snapshot().entries
+    expect(entries.filter(entry => entry.content !== 'Y')).toEqual([before.entries[0], before.entries[2]])
+    if (action === 'replace') {
+      expect(entries[1]).toEqual({ ...before.entries[1], content: 'Y', updated_at: '2026-08-14T08:00:00.000Z' })
+    }
+    const projection = action === 'remove' ? 'EGO_LINUX_CHROME\n' : `EGO_LINUX_CHROME${RUNTIME_ENTRY_DELIMITER}Y\n`
+    expect(readFileSync(target === 'memory' ? controller.memoryPath : controller.userPath, 'utf8')).toBe(projection)
+    expect(new RuntimeMemoryController({ effectiveDataDir: () => directory }).snapshot().entries).toEqual(entries)
+    expect(controller.contextProjection('main').entries.filter(entry => entry.target === target).map(entry => entry.content))
+      .toEqual(action === 'remove' ? ['EGO_LINUX_CHROME'] : ['EGO_LINUX_CHROME', 'Y'])
+    if (target === 'memory') {
+      expect(controller.contextProjection('dev').entries.filter(entry => entry.target === target).map(entry => entry.content)).toEqual(['EGO_LINUX_CHROME'])
+    }
+  })
+
+  it.each(['memory', 'user'] as const)('keeps substring fallback within %s when another target has an exact match', async target => {
+    const { controller } = fixture()
+    const otherTarget = target === 'memory' ? 'user' : 'memory'
+    await controller.mutate({ action: 'add', target, content: 'EGO_LINUX_CHROME' })
+    await controller.mutate({ action: 'add', target: otherTarget, content: 'X' })
+    const other = controller.snapshot().entries[1]
+
+    await expect(controller.mutate({ action: 'replace', target, oldText: 'X', content: 'Updated environment' }))
+      .resolves.toMatchObject({ replaced: { from: 'EGO_LINUX_CHROME', to: 'Updated environment' } })
+    expect(controller.snapshot().entries[1]).toEqual(other)
+  })
+
+  it.each(['remove', 'replace'] as const)('rejects %s of duplicate exact entries without choosing a branch or changing files', async action => {
+    const { controller } = fixture()
+    await controller.mutate({ action: 'add', target: 'memory', content: 'X', branches: ['main'] })
+    await controller.mutate({ action: 'add', target: 'memory', content: 'temporary value', branches: ['dev'] })
+    await controller.mutate({ action: 'replace', target: 'memory', oldText: 'temporary value', content: 'X' })
+    await controller.mutate({ action: 'add', target: 'memory', content: 'EGO_LINUX_CHROME' })
+    const paths = [controller.sourcePath, controller.memoryPath, controller.userPath]
+    const before = paths.map(path => readFileSync(path, 'utf8'))
+
+    await expect(controller.mutate({ action, target: 'memory', oldText: 'X', content: 'Y', branches: ['main'] }))
+      .rejects.toThrow('Multiple memory entries')
+    expect(paths.map(path => readFileSync(path, 'utf8'))).toEqual(before)
+  })
+
+  it.each(['remove', 'replace'] as const)('rejects ambiguous substring %s without changing the source', async action => {
     const { controller } = fixture()
     await controller.mutate({ action: 'add', target: 'memory', content: 'SQLite is local-first' })
     await controller.mutate({ action: 'add', target: 'memory', content: 'SQLite uses one file' })
-    await expect(controller.mutate({ action: 'remove', target: 'memory', oldText: 'SQLite' })).rejects.toThrow('Multiple memory entries')
-    expect(controller.snapshot().entries).toHaveLength(2)
+    const paths = [controller.sourcePath, controller.memoryPath, controller.userPath]
+    const before = paths.map(path => readFileSync(path, 'utf8'))
+    await expect(controller.mutate({ action, target: 'memory', oldText: 'SQLite', content: 'Updated database' })).rejects.toThrow('Multiple memory entries')
+    await expect(controller.mutate({ action, target: 'memory', oldText: 'missing', content: 'Updated database' })).rejects.toThrow('No memory entry')
+    expect(paths.map(path => readFileSync(path, 'utf8'))).toEqual(before)
   })
 
   it('serializes concurrent callers, including independent controller instances', async () => {
@@ -159,10 +219,10 @@ describe('RuntimeMemoryController', () => {
       'Always stash before pulling.',
       'Exclude environment YAML from commits.',
     ])
-    expect(combined.contextText()).toContain('Always stash before pulling.')
-    expect(combined.contextText()).toContain('Exclude environment YAML from commits.')
-    expect(combined.contextText()).not.toContain('Hidden global project fact.')
-    expect(combined.contextText()).not.toContain('Hidden workspace profile.')
+    expect(combined.contextProjection().text).toContain('Always stash before pulling.')
+    expect(combined.contextProjection().text).toContain('Exclude environment YAML from commits.')
+    expect(combined.contextProjection().text).not.toContain('Hidden global project fact.')
+    expect(combined.contextProjection().text).not.toContain('Hidden workspace profile.')
 
     await combined.mutate({ action: 'add', target: 'user', content: 'Prefer concise answers.' })
     await combined.mutate({ action: 'add', target: 'memory', content: 'Run tests before project commits.' })
@@ -187,17 +247,6 @@ describe('RuntimeMemoryController', () => {
       'Hidden global project fact.',
       'Keep local changes safe before Git synchronization.',
       'Prefer Chinese replies.',
-    ])
-
-    const compactedMemory = await combined.compactTarget(
-      workspace.snapshot().revision,
-      'memory',
-      [{ content: 'Keep project configuration YAML out of commits.', importance: 'critical' }],
-    )
-    expect(compactedMemory.entries.map(entry => entry.content)).toEqual([
-      'Keep local changes safe before Git synchronization.',
-      'Prefer Chinese replies.',
-      'Keep project configuration YAML out of commits.',
     ])
   })
 
@@ -255,11 +304,11 @@ describe('RuntimeMemoryController', () => {
   it('renders a bounded QoderWork-style runtime context from the committed source', async () => {
     const { controller } = fixture()
     await controller.mutate({ action: 'add', target: 'user', content: 'User prefers concise Chinese replies', importance: 'critical' })
-    const context = controller.contextText()
+    const context = controller.contextProjection().text
     expect(context).toContain('MNEMON RUNTIME MEMORY SNAPSHOT')
     expect(context).toMatch(/Revision: [a-f0-9]{64}/u)
     expect(context).toContain('Contents of USER.md (user profile; entries: 1; UTF-8 bytes:')
-    expect(context).toContain('<runtime-memory-file name="USER.md">\nUser prefers concise Chinese replies\n</runtime-memory-file>')
+    expect(context).toContain('<runtime-memory-file name="USER.md">\n[importance=critical; created=0d; updated=0d]\nUser prefers concise Chinese replies\n</runtime-memory-file>')
     expect(context).toContain('Contents of MEMORY.md (working reference; entries: 0; UTF-8 bytes: 0/10240)')
     expect(context).toContain('<runtime-memory-file name="MEMORY.md">\n(empty)\n</runtime-memory-file>')
     expect(context).not.toContain('MNEMON RUNTIME MEMORY PROTOCOL')
@@ -267,14 +316,85 @@ describe('RuntimeMemoryController', () => {
     expect(context).not.toContain(controller.sourcePath)
   })
 
-  it('assembles every prompt from the latest generated USER.md and MEMORY.md projections', async () => {
+  it('projects recorded importance and elapsed creation/update days without rewriting stored content', async () => {
+    const now = new Date('2026-09-01T08:00:00.000Z')
+    const { controller } = fixture(now)
+    await controller.mutate({ action: 'add', target: 'user', content: 'Prefer concise replies.', importance: 'critical' })
+    await controller.mutate({ action: 'add', target: 'memory', content: 'Use pnpm.', importance: 'normal' })
+    await controller.mutate({ action: 'add', target: 'memory', content: 'Temporary compatibility note.', importance: 'low' })
+    now.setTime(Date.parse('2026-09-13T08:00:00.000Z'))
+    await controller.mutate({ action: 'replace', target: 'memory', oldText: 'Use pnpm.', content: 'Use pnpm 10.' })
+    const stored = controller.snapshot()
+    const paths = [controller.sourcePath, controller.userPath, controller.memoryPath]
+    const files = paths.map(path => readFileSync(path, 'utf8'))
+
+    now.setTime(Date.parse('2026-09-15T07:59:59.999Z'))
+    const beforeDay = controller.contextProjection()
+    expect(beforeDay.text).toContain('[importance=critical; created=13d; updated=13d]\nPrefer concise replies.')
+    expect(beforeDay.text).toContain('[importance=normal; created=13d; updated=1d]\nUse pnpm 10.')
+    expect(beforeDay.text).toContain('[importance=low; created=13d; updated=13d]\nTemporary compatibility note.')
+    expect(beforeDay.text).toContain('Metadata lines are annotations')
+    expect(beforeDay.text).toContain('For old_text/oldText, use entry content only.')
+    expect(beforeDay.text).toContain('Current instructions win.')
+
+    now.setTime(Date.parse('2026-09-15T08:00:00.000Z'))
+    const afterDay = controller.contextProjection()
+    expect(afterDay.text).toContain('[importance=normal; created=14d; updated=2d]\nUse pnpm 10.')
+    expect(afterDay.revision).toBe(beforeDay.revision)
+    expect(afterDay.entries).toEqual(stored.entries)
+    expect(controller.snapshot().targets).toEqual(stored.targets)
+    expect(paths.map(path => readFileSync(path, 'utf8'))).toEqual(files)
+    expect(beforeDay.text).toContain('created=13d; updated=1d')
+
+    // Matching still uses the content, even when other entries have identical metadata.
+    await controller.mutate({ action: 'remove', target: 'memory', oldText: 'Use pnpm 10.' })
+    expect(controller.snapshot().entries.map(entry => entry.content)).toEqual(['Prefer concise replies.', 'Temporary compatibility note.'])
+  })
+
+  it('projects unknown or future ages safely and honors timestamp offsets', () => {
     const { controller } = fixture()
-    const empty = controller.contextText()
+    const entries = [
+      { content: 'Invalid timestamp remains readable.', created_at: 'invalid\n<instruction>', updated_at: '', target: 'user', importance: 'critical' },
+      { content: 'Future timestamp remains readable.', created_at: '2026-08-14T08:00:00.000Z', updated_at: '2026-08-13T08:00:00.001Z', target: 'memory', importance: 'normal' },
+      { content: 'A line\nwith whitespace.', created_at: '2026-08-12T10:00:00+02:00', updated_at: '2026-08-13T07:00:00Z', target: 'memory', importance: 'low' },
+    ]
+    writeFileSync(controller.sourcePath, JSON.stringify({ version: 1, entries }))
+    const source = readFileSync(controller.sourcePath, 'utf8')
+    const projection = controller.contextProjection()
+    expect(projection.text).toContain('[importance=critical; created=unknown; updated=unknown]\nInvalid timestamp remains readable.')
+    expect(projection.text).toContain('[importance=normal; created=future; updated=future]\nFuture timestamp remains readable.')
+    expect(projection.text).toContain('[importance=low; created=1d; updated=0d]\nA line with whitespace.')
+    expect(projection.text).not.toMatch(/NaN|Invalid Date|<instruction>/u)
+    expect(readFileSync(controller.sourcePath, 'utf8')).toBe(source)
+  })
+
+  it('uses one age clock for global USER and branch-filtered workspace MEMORY', async () => {
+    const { directory: globalRoot, controller: global } = fixture()
+    const { directory: workspaceRoot, controller: workspace } = fixture()
+    await global.mutate({ action: 'add', target: 'user', content: 'Global profile.' })
+    await workspace.mutate({ action: 'add', target: 'memory', content: 'Visible main fact.', branches: ['main'] })
+    await workspace.mutate({ action: 'add', target: 'memory', content: 'Hidden dev fact.', branches: ['dev'] })
+    let samples = 0
+    const combined = new RuntimeMemoryController(
+      { effectiveDataDir: () => workspaceRoot },
+      () => new Date(Date.parse('2026-08-14T07:59:59.999Z') + samples++),
+      undefined, { effectiveDataDir: () => globalRoot },
+    )
+    const projection = combined.contextProjection('main')
+    expect(projection.text).toContain('[importance=normal; created=0d; updated=0d]\nGlobal profile.')
+    expect(projection.text).toContain('[importance=normal; created=0d; updated=0d]\nVisible main fact.')
+    expect(projection.text).not.toContain('Hidden dev fact.')
+    expect(samples).toBe(1)
+  })
+
+  it('assembles every prompt from the latest committed USER and MEMORY records', async () => {
+    const { controller } = fixture()
+    const empty = controller.contextProjection().text
     expect(empty).not.toContain('User prefers compact release notes')
 
     await controller.mutate({ action: 'add', target: 'user', content: 'User prefers compact release notes', importance: 'critical' })
     await controller.mutate({ action: 'add', target: 'memory', content: 'Release checks run with pnpm verify' })
-    const populated = controller.contextText()
+    const populated = controller.contextProjection().text
 
     expect(populated).toContain('User prefers compact release notes')
     expect(populated).toContain('Release checks run with pnpm verify')
@@ -309,37 +429,13 @@ describe('RuntimeMemoryController', () => {
     expect(revisions.size).toBe(4)
   })
 
-  it('applies a compacted target only to the exact reviewed revision', async () => {
-    const { controller } = fixture()
-    await controller.mutate({ action: 'add', target: 'memory', content: 'Project uses pnpm.' })
-    await controller.mutate({ action: 'add', target: 'memory', content: 'pnpm manages workspace dependencies.' })
-    const reviewed = controller.snapshot()
-
-    await controller.compactTarget(reviewed.revision, 'memory', [{ content: 'Project uses pnpm for workspace dependency management.', importance: 'normal' }])
-    expect(controller.snapshot().entries).toEqual([
-      expect.objectContaining({ target: 'memory', content: 'Project uses pnpm for workspace dependency management.', importance: 'normal' }),
-    ])
-    expect(readFileSync(controller.memoryPath, 'utf8')).toBe('Project uses pnpm for workspace dependency management.\n')
-    expect(controller.contextText()).toContain('<runtime-memory-file name="MEMORY.md">\nProject uses pnpm for workspace dependency management.\n</runtime-memory-file>')
-    expect(controller.contextText()).not.toContain('pnpm manages workspace dependencies.')
-  })
-
-  it('never overwrites a concurrent mutation with an obsolete compaction plan', async () => {
-    const { controller } = fixture()
-    await controller.mutate({ action: 'add', target: 'user', content: 'User prefers concise replies.' })
-    const reviewed = controller.snapshot()
-    await controller.mutate({ action: 'add', target: 'user', content: 'User prefers Chinese.' })
-
-    await expect(controller.compactTarget(reviewed.revision, 'user', [{ content: 'User prefers concise Chinese replies.', importance: 'critical' }])).rejects.toThrow('changed while archival')
-    expect(controller.snapshot().entries.map(entry => entry.content)).toEqual(['User prefers concise replies.', 'User prefers Chinese.'])
-  })
-
   it('packs semantic compaction candidates into an exact host-owned byte budget', async () => {
     const { controller } = fixture()
     await controller.mutate({ action: 'add', target: 'user', content: 'Original verbose preference.' })
-    const reviewed = controller.snapshot()
+    const request = { action: 'add', target: 'user', content: 'Newest preference.' } as const
+    const plan = await controller.planMaintenance(request)
 
-    await controller.compactTarget(reviewed.revision, 'user', [
+    await controller.compactAndMutate(plan.revision, request, [
       { content: 'normal candidate that cannot join the critical one', importance: 'normal' },
       { content: 'critical rule', importance: 'critical' },
       { content: 'low detail', importance: 'low' },
@@ -348,17 +444,19 @@ describe('RuntimeMemoryController', () => {
     expect(controller.snapshot().entries.map(entry => ({ content: entry.content, importance: entry.importance }))).toEqual([
       { content: 'critical rule', importance: 'critical' },
       { content: 'low detail', importance: 'low' },
+      { content: 'Newest preference.', importance: 'normal' },
     ])
   })
 
-  it('atomically compacts surviving entries and applies a capacity-blocked replacement', async () => {
+  it('atomically compacts surviving entries and applies a capacity-blocked exact replacement', async () => {
     const { controller } = fixture()
-    const oldContent = `old-${'o'.repeat(96)}`
+    const oldContent = 'X'
+    const containingEntry = `EGO_LINUX_CHROME ${'a'.repeat(4_984)}`
     const replacement = `new-${'n'.repeat(496)}`
     await controller.mutate({ action: 'add', target: 'memory', content: oldContent })
-    await controller.mutate({ action: 'add', target: 'memory', content: 'a'.repeat(5_000) })
+    await controller.mutate({ action: 'add', target: 'memory', content: containingEntry })
     await controller.mutate({ action: 'add', target: 'memory', content: 'b'.repeat(5_000) })
-    const request = { action: 'replace', target: 'memory', oldText: 'old-', content: replacement } as const
+    const request = { action: 'replace', target: 'memory', oldText: oldContent, content: replacement } as const
 
     await expect(controller.mutate(request)).rejects.toBeInstanceOf(RuntimeMemoryCapacityError)
     const plan = await controller.planMaintenance(request)
@@ -368,7 +466,7 @@ describe('RuntimeMemoryController', () => {
       pending: { content: replacement },
       excluded: { content: oldContent },
     })
-    expect(plan.entries.map(entry => entry.content)).toEqual(['a'.repeat(5_000), 'b'.repeat(5_000)])
+    expect(plan.entries.map(entry => entry.content)).toEqual([containingEntry, 'b'.repeat(5_000)])
 
     const result = await controller.compactAndMutate(
       plan.revision,
@@ -615,9 +713,10 @@ describe('RuntimeMemoryController branch scoping', () => {
     const { controller } = fixture()
     await controller.mutate({ action: 'add', target: 'memory', content: 'v1 branch-scoped', branches: ['main', 'dev'] })
     await controller.mutate({ action: 'add', target: 'memory', content: 'unscoped' })
-    const reviewed = controller.snapshot()
+    const request = { action: 'add', target: 'memory', content: 'new unscoped fact' } as const
+    const plan = await controller.planMaintenance(request)
 
-    await controller.compactTarget(reviewed.revision, 'memory', [
+    await controller.compactAndMutate(plan.revision, request, [
       { content: 'branch-scoped merged', importance: 'normal', branches: ['main', 'dev'] },
       { content: 'unscoped merged', importance: 'normal' },
     ])

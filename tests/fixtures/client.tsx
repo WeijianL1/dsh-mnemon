@@ -18,22 +18,27 @@ function sourcePages(t: MnemonTranslate) {
     getVersion: slots.getVersion.bind(slots),
     entriesOfSlot: slots.entriesOfSlot.bind(slots),
     subscribe: slots.subscribe.bind(slots),
-  } }
+  }, locale: { getSnapshot: () => 'zh', subscribe: () => () => {} } }
   for (const install of [installRuntimeMemoryUI, installDocumentsMemoryUI, installMemorySpacesUI]) releases.push(install(ctx as never, t))
   return {
     sourcePageDirectory: createMemorySourcePageDirectory(ctx as never),
     renderSlot: ((_name: string, props: MemorySourcePageProps, options: { only?: string }) => {
       const entry = slots.entriesOfSlot(MNEMON_SOURCE_PAGE_SLOT).find(entry => entry.options.id === options.only)
-      return entry === undefined ? null : createElement(entry.component as ComponentType<MemorySourcePageProps>, props)
+      return entry === undefined ? null : <div data-slot={MNEMON_SOURCE_PAGE_SLOT} style={{ display: 'contents' }}>{createElement(entry.component as ComponentType<MemorySourcePageProps>, props)}</div>
     }) as NonNullable<ComponentProps<typeof MnemonWorkbench>['renderSlot']>,
     dispose: () => { for (const release of releases.reverse()) release() },
   }
 }
 
-export function ComposedMnemonWorkbench(props: ComponentProps<typeof MnemonWorkbench>) {
+/** `runningSources` limits the Source catalog to the Sources whose components run. */
+export function ComposedMnemonWorkbench({ runningSources, ...props }: ComponentProps<typeof MnemonWorkbench> & { runningSources?: readonly string[] }) {
   const pages = useMemo(() => sourcePages(props.t ?? translateZh), [props.t])
   useEffect(() => () => pages.dispose(), [pages])
-  const connection = useMemo(() => ({ ...props.connection, rpc: { ...props.connection.rpc, call: sourceTransport(props.connection.rpc.call.bind(props.connection.rpc)) } }), [props.connection])
+  const running = runningSources?.join('\u0000')
+  const connection = useMemo(() => {
+    const catalog = running === undefined ? sourceCatalog : { ...sourceCatalog, sources: sourceCatalog.sources.filter(source => running.split('\u0000').includes(source.sourceTypeId)) }
+    return { ...props.connection, rpc: { ...props.connection.rpc, call: sourceTransport(props.connection.rpc.call.bind(props.connection.rpc), catalog) } }
+  }, [props.connection, running])
   return <MnemonWorkbench {...pages} {...props} connection={connection as typeof props.connection} />
 }
 
@@ -51,12 +56,17 @@ export const sourceCatalog: MemorySourceManagementCatalog = {
 }
 
 /** Domain fixtures remain independent of the Source transport envelope. */
-export function sourceTransport(domain: (channel: string, endpoint: string, payload?: Record<string, unknown>) => Promise<any>) {
-  return async (channel: string, endpoint: string, payload?: Record<string, unknown>) => {
-    if (endpoint === 'source-management-catalog') return { ok: true, value: sourceCatalog }
-    if (!['source-management-read', 'source-management-mutate', 'source-assistance'].includes(endpoint)) return domain(channel, endpoint, payload)
+export function sourceTransport(domain: (channel: string, endpoint: string, payload?: Record<string, unknown>) => Promise<any>, catalog: MemorySourceManagementCatalog = sourceCatalog) {
+  return async (channel: string, transportEndpoint: string, transportPayload?: Record<string, unknown>) => {
+    const gateway = channel === '/api' && transportEndpoint.startsWith('dshMnemon/')
+    const gatewayArgs = gateway ? transportPayload?.args as Record<string, unknown> | undefined : undefined
+    const endpoint = gateway ? String(gatewayArgs?.endpoint) : transportEndpoint
+    const payload = gateway ? gatewayArgs?.payload as Record<string, unknown> | undefined : transportPayload
+    const wrap = (response: unknown): unknown => gateway ? { ok: true, value: response } : response
+    if (endpoint === 'source-management-catalog') return wrap({ ok: true, value: catalog })
+    if (!['source-management-read', 'source-management-mutate', 'source-assistance'].includes(endpoint)) return wrap(await domain(channel, endpoint, payload))
     const key = String(payload?.sourceInstanceKey)
-    if (!sourceCatalog.sources.some(source => source.sourceInstanceKey === key)) throw new Error('Unregistered test Source: ' + key)
+    if (!catalog.sources.some(source => source.sourceInstanceKey === key)) throw new Error('Unregistered test Source: ' + key)
     const type = key.slice('source:mnemon-source-'.length)
     const operation = String(payload?.operation)
     const input: Record<string, unknown> = { ...(payload?.input as Record<string, unknown> ?? {}),
@@ -72,6 +82,6 @@ export function sourceTransport(domain: (channel: string, endpoint: string, payl
     if (operation === 'activation') logical = 'body'
     if (input.oldText !== undefined) { input.old_text = input.oldText; delete input.oldText }
     const response = await domain(channel, logical, input)
-    return !response.ok ? response : { ok: true, value: { revision: 'r1', value: response.value } }
+    return wrap(!response.ok ? response : { ok: true, value: { revision: 'r1', value: response.value } })
   }
 }

@@ -1,0 +1,10 @@
+{
+  "upstreamCommit": "2296898d",
+  "sha256": {
+    "docs/assets/webui-v0.5.19/en/plugins.gif": "cf0624f771c297317d5a3f30eb535b9fbd26110c13d416cf1eba01e86dc5c247",
+    "docs/assets/webui-v0.5.19/en/save.gif": "d1ca13e98bdd18c3b0c4a0880a460b8fa43a88de5ec54ccf9b82832f7e543d8d",
+    "docs/assets/webui-v0.5.4/en/demo.mp4": "2b774a3de3af666158430d81c7ef2ddb5b78fd60f30e95b46bdce6094c0093c5",
+    "docs/assets/webui-v0.5.4/zh-CN/demo.mp4": "ba52e708186388487e305a000708f4789115db7e12ceda8a79c414f9bc539591",
+    "docs/pr-assets/issue-259-windows-git-console/windows-evidence.tar.gz": "f976d55ec68f6b18322e2c9e7b391f3a9d4ab4c965f15db9da6a60ff3a996dea"
+  }
+}

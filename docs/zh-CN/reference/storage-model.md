@@ -1,12 +1,12 @@
-# 存储与三层记忆模型
+# 存储与记忆模型
 
 **简体中文** | [English](../../en/reference/storage-model.md) | [文档中心](../README.md)
 
-## 为什么是三层
+## 为什么分三类记忆
 
-默认 Starter 用三个独立 Source 处理不同的访问模式。这是默认组合，不是 Core 的固定分类，也不限制第三方 Source 的形态：
+默认 Starter 用三个独立 Source 处理不同的访问模式，再由分层策略把它们组合进每一轮。这是默认组合，不是 Core 的固定分类，也不限制第三方 Source 的形态：
 
-| 问题 | 对应层 | 原因 |
+| 问题 | 存放位置 | 原因 |
 |---|---|---|
 | 下一轮必须直接知道什么？ | Runtime Memory | 极小、直接进入 prompt |
 | 哪份设计或流程需要快速完整阅读？ | active Documents | 保留 Markdown 结构，不必做深召回 |
@@ -59,6 +59,9 @@ follow an exact cold reference when full text is required
 
 `storageScope` 决定整个根，而不只是 Mnemon 数据库。`workspace` 范围会为每个已登记 DSH 工作区解析独立的 `<workspace>/.mnemon`。显式启用的 `runtimeUserScope=global` 是唯一的分根例外：Runtime 从全局根读取 USER.md，MEMORY.md 与其他所有组件仍留在所选根。工作台任务使用查看工作区；对话工具与生命周期使用所属会话的 cwd 和已固定的 View。`state/memory-providers.json` 保存第三方 endpoint、目标 URI、身份和可选凭据；文件权限为 `0600`，Host 只返回已配置字段名，不回传凭据值。
 
+`workspaces` 布局把四个 area 集中在 `<集中根>/workspaces/<工作区路径哈希>/`；Host 解析目录时不创建文件或修改旧根。只有显式 `runtimeUserScope: global` 会把 USER.md 放在该工作区子目录之外。
+
+
 <a id="runtime-memory"></a>
 
 ## 运行时记忆
@@ -67,7 +70,7 @@ follow an exact cold reference when full text is required
 
 - `target=user`：身份、角色、长期偏好、习惯、沟通风格和明确协作要求。
 - `target=memory`：项目、环境、决策、约定、工具特性和可复用经验。
-- `importance=critical|normal|low`：用于整理时的保留优先级。
+- `importance=critical|normal|low`：记录的重要性，在模型投影中可见，也用于整理时的保留优先级。
 - `branches`（可选，仅 `target=memory`）：限定该条目在每回合 Runtime 快照中投影到的 git 分支名列表；没有分支列表的条目在所有分支可见。
 
 当前不实现 `daily` target。
@@ -89,21 +92,34 @@ branches（可选）
 
 `USER.md` 和 `MEMORY.md` 是完整事实源的确定性派生文件。每个条目被归一成单行，条目之间使用单独一行的 `§` 分隔；`§` 是保留字符。启动和 prompt 组装时，控制层会从 JSON 修复缺失或被手工修改的投影。分支过滤只作用于 prompt 投影，不作用于这两个文件。
 
+Runtime Source 会在面向模型的快照中，为每条正文添加一行元数据：
+
+```text
+[importance=critical; created=14d; updated=2d]
+偏好简洁回复。
+```
+
+`created` 和 `updated` 表示距存储时间戳经过的完整 24 小时天数，在捕获投影时统一计算。不到一天显示 `0d`；未来时间戳显示 `future`，无法解析的时间戳显示 `unknown`。用户档案位于全局根时，两个根使用同一个捕获时间。当前回合保持已捕获的天数；下一回合会重新计算，即使存储 revision 没有变化。
+
+这些行是正文之外的注释。`old_text` / `oldText` 只能匹配正文，不包含元数据行。记录的重要性和时间跨度不会覆盖当前指令。JSON、磁盘 Markdown、正文匹配、条目顺序和存储容量均保持不变。注释计入已有的模型投影字符预算，因此短条目较多时，即使默认 Strategy 也可能截断或省略条目。其指引明确说明快照受预算限制，缺失不代表删除；light-context 可以进一步降低预算。
+
 ### 操作
 
 - `add` 写入独立新事实，完全相同的内容不会重复添加。
-- `replace` 用 `old_text` 的唯一子串定位并替换整个条目。
-- `remove` 用唯一子串移除整个条目。
-- 零命中或多命中都拒绝，不执行模糊修改。
+- `replace` 和 `remove` 先在请求的 `target` 内，用规范化后的 `old_text` 匹配完整正文，再替换或移除整个条目。唯一的精确匹配优先，即使其他条目也包含同样的文本。
+- 没有完整正文匹配时，仍可用唯一子串定位条目。
+- 零命中、重复的精确匹配和有歧义的子串匹配均拒绝，不改动存储，也不执行模糊修改。分支标签控制投影，不用于选择 mutation 的目标条目。
 
 ### 容量
 
-| 目标 | 上限 | 维护方式 |
+| 目标 | 默认上限 | 维护方式 |
 |---|---:|---|
 | `USER.md` | 4 KiB | 本地、无工具 worker 保守合并，不进入 Memory Space |
 | `MEMORY.md` | 10 KiB | Host 精确归档已提交条目，再确定性装填热记忆余量 |
 
-容量按投影正文的实际 UTF-8 字节计算。单条内容最大 8 KiB。当 `add`、`replace` 或 `remove` 遇到容量溢出时，Host 会在任何 Provider 写入前重新检查源 revision。只有一个可写 Memory Space 时完全不调用模型；存在多个空间时，worker 只读取有界路由摘录并返回目标 id，不重写记忆内容。Mnemon Native 按目标空间通过 schema-v1 draft 各导入一次，其他 Provider 继续使用适配器定义的写入语义。Host 要求每个源条目都有一条精确终态回执（跳过的重复项还必须有精确 Recall 证据），随后按重要性和字节预算选择热记忆保留项，并在原 revision fence 下把余量与待处理变更一次提交。Provider 无法与本地文件共享同一事务，因此稍后的 revision 冲突可能留下已经归档的重复项；持久层仍保留去重，重试是安全的。
+两个上限都可以通过 `runtimeMemory.userLimitBytes` 与 `runtimeMemory.memoryLimitBytes` 调整，见 [Runtime Memory 容量与维护预算](./configuration.md#runtime-memory-容量与维护预算)。分层策略下，合法写入超过上限时才触发容量维护；其他策略会直接拒绝该写入。具名工具、通用 Action、后台子 Agent 和 Web 管理共用同一 Host 流程；Web 写入按所选存储范围执行，不要求打开用户会话。归档失败会保留热记忆并返回错误。底层 Source 独立使用时仍只执行自己的存储操作，自定义 Strategy 不会隐式继承默认归档。
+
+容量按存储正文和条目分隔符的实际 UTF-8 字节计算，不包含仅用于 prompt 的元数据。单条内容最大 8 KiB。当 `add`、`replace` 或 `remove` 遇到容量溢出时，Host 会在任何 Provider 写入前重新检查源 revision。只有一个可写 Memory Space 时完全不调用模型；存在多个空间时，worker 只读取有界路由摘录并返回目标 id，不重写记忆内容。Mnemon Native 先从只读命名空间快照复用完全相同的原文，合并批内相同条目，再按目标空间通过 schema-v1 draft 和 `--no-diff` 各导入一次剩余原文，避免内容相似但不同的事实被跳过或相互覆盖。其他 Provider 继续使用适配器定义的写入语义。Host 要求每个源条目都有一条精确终态回执（跳过的重复项还必须有精确 Recall 证据），随后按重要性和字节预算选择热记忆保留项，并在原 revision fence 下把余量与待处理变更一次提交。Provider 无法与本地文件共享同一事务，因此稍后的 revision 冲突或并发外部写入可能留下已经归档的重复项；现有热记忆仍受修订检查保护。
 
 <a id="project-documents"></a>
 
@@ -135,7 +151,7 @@ Documents 保存比单条记忆更完整、又希望快速阅读的项目知识�
 
 Documents 的物理共享范围由 `storageScope` 决定：
 
-- `workspace`：通常随项目隔离；
+- `workspace` / `workspaces`：通常随项目隔离；
 - `global` / `custom`：多个工作区可能共享同一个 `documents/index.json`。
 
 因此“项目档案”表示内容类型，不保证天然按工作区物理隔离。当前会话工作区只约束新写入的 `sourcePaths`。
@@ -158,7 +174,7 @@ Documents 的物理共享范围由 `storageScope` 决定：
 
 ## 记忆空间
 
-记忆空间是第三层统一语义与路由单位，具体数据面由 Provider 决定：
+记忆空间是长期记忆的统一语义与路由单位，具体数据面由 Provider 决定：
 
 ```text
 id            Host 生成或沿用已发现的 Mnemon Store 名

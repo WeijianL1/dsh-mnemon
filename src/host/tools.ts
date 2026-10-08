@@ -96,8 +96,7 @@ export function registerTools(ctx: HostContextShape, runtimeSource: MnemonAgentR
       presentationMeta: memoryWritePresentation(undefined, 'view-action', 'offerId') },
     execute: (args: { offerId: string; input: MemoryJsonValue }, exec: ToolExecution) => {
       if (!config.writeEnabled) throw new Error('dsh-mnemon is configured read-only (writeEnabled: false)')
-      const { manager, turn } = composableTurn(exec)
-      return manager.executeAction(turn.turnId, args.offerId, args.input, offer => offer.authority === undefined, exec.signal)
+      return coordinator.action(requireAgent(exec), args.offerId, args.input, exec.signal)
     },
     presentCall: (args: { offerId: string }) => ({ card: 'generic', title: 'Apply composable memory action', kind: 'edit', rawInput: args.offerId }),
     presentResult: () => ({ card: 'generic', title: 'Composable memory receipt ready' }),
@@ -210,6 +209,29 @@ export function registerTools(ctx: HostContextShape, runtimeSource: MnemonAgentR
   } as never))
 
   ctx.tools.register(definition({
+    name: 'mnemon_document_create',
+    description: 'Create one new managed project Document without updating or archiving existing documents. Search first and skip duplicates; save only substantial new reusable project knowledge, with references to related document ids. Capacity exhaustion rejects creation and preserves existing documents.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        title: { type: 'string', description: 'Meaningful project-document title.' },
+        description: { type: 'string', description: 'Concise routing description.' },
+        content: { type: 'string', description: 'New managed Markdown body.' },
+        sourcePaths: { type: 'array', items: { type: 'string' }, description: 'Read-only source paths relative to the workspace.' },
+      },
+      required: ['title', 'content'],
+    },
+    output: { schema: JSON_OBJECT_OUTPUT, render: (_args: unknown, value: unknown) => text(value),
+      presentationMeta: memoryWritePresentation('documents', 'create') },
+    execute: (args: { title: string; description?: string; content: string; sourcePaths?: string[] }, exec: ToolExecution) => {
+      requireSource(exec, 'documents', 'write')
+      return sourceAction(exec, 'documents', 'create', { ...args, sessionIds: [requireAgent(exec).id] })
+    },
+    presentCall: (args: { title: string }) => ({ card: 'generic', title: 'Create Mnemon Document', kind: 'edit', rawInput: args.title }),
+    presentResult: () => ({ card: 'generic', title: 'Mnemon Document created' }),
+  } as never))
+
+  ctx.tools.register(definition({
     name: 'mnemon_document_manage',
     description: 'Create or update one managed project Document through the Mnemon Documents control plane. Use for substantial reusable project knowledge, not user-profile preferences, routine progress, raw transcripts, secrets, or small hot-memory facts. Source paths are references inside the workspace and are never edited. Archive is allowed only from a root request and first writes a durable Mnemon cold-reference through an isolated subagent.',
     parameters: {
@@ -255,9 +277,9 @@ export function registerTools(ctx: HostContextShape, runtimeSource: MnemonAgentR
         action: { type: 'string', enum: ['add', 'replace', 'remove'], description: 'add a new entry, replace one uniquely matched entry, or remove one uniquely matched entry.' },
         target: { type: 'string', enum: ['memory', 'user'], description: 'user for user identity/preferences; memory for project, environment, decisions, and lessons.' },
         content: { type: 'string', description: 'Compact entry content. Required for add and replace.' },
-        old_text: { type: 'string', description: 'Unique substring of the existing entry. Required for replace and remove.' },
+        old_text: { type: 'string', description: 'Full content of the existing entry, or a unique substring. A unique full-content match takes precedence within the selected target. Required for replace and remove.' },
         importance: { type: 'string', enum: ['critical', 'normal', 'low'], description: 'critical for explicit must/always/never rules; low for transient facts; normal by default.' },
-        branches: { type: 'array', items: { type: 'string' }, description: 'Optional git branch names restricting where a target=memory entry is injected. Omit for cross-branch facts; on replace an empty list clears the scope and an omitted list keeps it. Never accepted for target=user.' },
+        branches: { type: 'array', items: { type: 'string' }, description: 'Optional git branch names restricting where a target=memory entry is injected. Omit for cross-branch facts; on replace an empty list clears the scope and an omitted list keeps it. For target=user, omit or pass []; non-empty branches are rejected.' },
       },
       required: ['action', 'target'],
     },
@@ -266,15 +288,16 @@ export function registerTools(ctx: HostContextShape, runtimeSource: MnemonAgentR
     execute: (args: { action: 'add' | 'replace' | 'remove'; target: RuntimeMemoryTarget; content?: string; old_text?: string; importance?: RuntimeMemoryImportance; branches?: string[] }, exec: ToolExecution) => {
       if (!config.writeEnabled) throw new Error('dsh-mnemon is configured read-only (writeEnabled: false)')
       requireSource(exec, 'runtime', 'write')
+      composableTurn(exec)
       const request = {
         action: args.action,
         target: args.target,
         ...(args.content === undefined ? {} : { content: args.content }),
         ...(args.old_text === undefined ? {} : { oldText: args.old_text }),
         ...(args.importance === undefined ? {} : { importance: args.importance }),
-        ...(args.branches === undefined ? {} : { branches: args.branches }),
+        ...(args.branches === undefined || (args.target === 'user' && Array.isArray(args.branches) && args.branches.length === 0) ? {} : { branches: args.branches }),
       }
-      return isSubagent(exec.agent) ? sourceAction(exec, 'runtime', 'mutate', request) : coordinator.runtime(requireAgent(exec), request, exec.signal)
+      return coordinator.runtime(requireAgent(exec), request, exec.signal)
     },
     presentCall: (args: { action: string; target: string }) => ({ card: 'generic', title: `${args.action} runtime ${args.target} memory`, kind: 'edit' }),
     presentResult: () => ({ card: 'generic', title: 'Runtime memory updated' }),
@@ -282,7 +305,7 @@ export function registerTools(ctx: HostContextShape, runtimeSource: MnemonAgentR
 
   ctx.tools.register(definition({
     name: 'mnemon_remember',
-    description: 'Archive one durable insight in a selected provider-backed Memory Space. Ordinary new hot memory belongs in mnemon_runtime_memory; use direct archival only for explicit long-term persistence or runtime capacity migration. Choose the narrowest existing space, search it first, verify capabilities.remember=true, and wait for the provider receipt. OpenViking writes are asynchronous semantic extraction and may truthfully return skipped. Do not dump transcripts, temporary progress, routine observations, or repository-obvious facts.',
+    description: 'Archive one durable insight in a selected provider-backed Memory Space. Ordinary new hot memory belongs in mnemon_runtime_memory; use direct archival only for explicit long-term persistence or runtime capacity migration. Choose the narrowest existing space, search it first, verify capabilities.remember=true, and wait for the provider receipt. Exact writes require confirmed persistence; providers using semantic extraction may truthfully return skipped. Do not dump transcripts, temporary progress, routine observations, or repository-obvious facts.',
     parameters: {
       type: 'object',
       properties: {

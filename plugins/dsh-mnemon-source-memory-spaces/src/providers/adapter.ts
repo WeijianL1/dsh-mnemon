@@ -18,10 +18,22 @@ export interface MemorySpaceAuthority {
   providerConnection(id: string, expectedProviderId?: string): MemoryProviderConnection
 }
 
+/** Per-call options of the Native command transport. */
+export interface MemorySpaceNativeRunOptions {
+  signal?: AbortSignal
+  store?: string
+  /**
+   * Output cap for this call, in bytes (default 2 MiB). Raise it only for reads
+   * whose size the Store itself bounds, such as a whole-Store dump; Source
+   * hosts older than 0.5.14 ignore it and keep the default.
+   */
+  maxOutputBytes?: number
+}
+
 /** Scoped command transport consumed by the Native Provider. */
 export interface MemorySpaceNativeRunner {
-  runJson(args: readonly string[], options?: { signal?: AbortSignal; store?: string }): Promise<JsonValue>
-  runText(args: readonly string[], options?: { signal?: AbortSignal; store?: string }): Promise<string>
+  runJson(args: readonly string[], options?: MemorySpaceNativeRunOptions): Promise<JsonValue>
+  runText(args: readonly string[], options?: MemorySpaceNativeRunOptions): Promise<string>
 }
 
 export interface MemoryProviderAdapterFactoryContext {
@@ -53,6 +65,14 @@ export type MemoryProviderScoreSemantics = 'normalized-relevance' | 'provider-na
 
 export const NORMALIZED_RELEVANCE_SCORE: ProviderScoreSemantics = Object.freeze({ kind: 'normalized-relevance' })
 
+/** The memories of one Memory Space that carry entities, as the Provider's own index has them. */
+export interface ProviderEntityIndex {
+  /** Each memory with at least one entity, listing its entities. */
+  memories: Insight[]
+  /** False when the Provider could not include every memory of the space. */
+  complete: boolean
+}
+
 /** One provider-owned namespace projected into DSH as a Memory Space. */
 export interface ProviderMemorySpace {
   /** Stable identifier owned by the provider, never a DSH-generated title. */
@@ -80,6 +100,12 @@ export interface MemoryProviderAdapter {
   remember(body: MemorySpace, request: RememberRequest, signal?: AbortSignal): Promise<JsonValue>
   /** Optional cheap bounded metadata sampling, without a graph projection. */
   metadataSample?(body: MemorySpace, limit: number, signal?: AbortSignal): Promise<Insight[]>
+  /**
+   * Optional entity index for the Entities page. Without it the Source builds
+   * the index from list(), so a Provider whose list() stops short of every
+   * memory, or that cannot list, implements this to keep entity counts whole.
+   */
+  entityIndex?(body: MemorySpace, signal?: AbortSignal): Promise<ProviderEntityIndex>
   /** Persist an ordered host-authorized batch and return one receipt per request. */
   rememberMany?(body: MemorySpace, requests: readonly RememberRequest[], signal?: AbortSignal): Promise<JsonValue[]>
   related?(body: MemorySpace, id: string, depth: number, edge?: EdgeType, signal?: AbortSignal): Promise<Insight[]>

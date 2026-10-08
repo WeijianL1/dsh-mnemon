@@ -1,12 +1,12 @@
-# Storage and the Three-Layer Memory Model
+# Storage and the Memory Model
 
 [简体中文](../../zh-CN/reference/storage-model.md) | **English** | [Documentation Center](../README.md)
 
-## Why Three Layers
+## Why three kinds of memory
 
-The default Starter combines three independent Sources for different access patterns. This is a useful default, not a Core requirement or a restriction on third-party Sources:
+The default Starter combines three independent Sources for different access patterns, and the Layered strategy composes them into each turn. This is a useful default, not a Core requirement or a restriction on third-party Sources:
 
-| Question | Corresponding layer | Reason |
+| Question | Where it lives | Reason |
 |---|---|---|
 | What must be known directly on the next turn? | Runtime Memory | Tiny and injected directly into the prompt |
 | Which design or procedure needs to be read quickly and in full? | active Documents | Preserves Markdown structure without deep recall |
@@ -59,13 +59,16 @@ Use `global` for a common local root, `custom` for an explicitly agreed root, or
 
 `storageScope` determines the entire root, not just the Mnemon databases. The `workspace` scope resolves an independent `<workspace>/.mnemon` for every registered DSH workspace. The opt-in `runtimeUserScope=global` is the sole split-root exception: Runtime reads USER.md from the global root while MEMORY.md and every other component remain under the selected root. Workbench tasks use the inspected workspace; conversation tools and lifecycle hooks use their owning session's cwd and pinned View. `state/memory-providers.json` stores third-party endpoints, target URIs, identities, and optional credentials. Its mode is `0600`; the Host returns configured field names, never saved credential values.
 
+The `workspaces` layout keeps all four areas under `<central-root>/workspaces/<workspace-path-hash>/`; Host path resolution never creates files or changes old roots. Only explicit `runtimeUserScope: global` places USER.md outside that workspace subtree.
+
+
 ## Runtime Memory
 
 ### Semantics
 
 - `target=user`: identity, role, long-term preferences, habits, communication style, and explicit collaboration requirements.
 - `target=memory`: projects, environment, decisions, conventions, tool characteristics, and reusable experience.
-- `importance=critical|normal|low`: retention priority during maintenance.
+- `importance=critical|normal|low`: recorded importance, visible in the model projection and used for retention priority during maintenance.
 - `branches` (optional, `target=memory` only): a list of git branch names limiting where the entry is projected in the per-turn Runtime snapshot; entries without a branch list are visible on every branch.
 
 There is currently no `daily` target.
@@ -87,21 +90,34 @@ branches (optional)
 
 `USER.md` and `MEMORY.md` are deterministic derived files of the complete store. Each item is normalized to one line, and items are separated by a line containing only `§`; `§` is a reserved character. During startup and prompt assembly, the control layer repairs missing or manually modified projections from the JSON source. Branch filtering applies only to the prompt projection, never to these files.
 
+The Runtime Source adds a metadata line before each entry in the model-facing snapshot:
+
+```text
+[importance=critical; created=14d; updated=2d]
+Prefer concise replies.
+```
+
+`created` and `updated` are elapsed whole 24-hour days since the stored timestamps, computed once when the projection is captured. Ages below one day are `0d`; future timestamps show `future`, and unparseable timestamps show `unknown`. One capture time covers both roots when the user profile is global. The current turn retains its captured ages; the next turn recalculates them even if the storage revision has not changed.
+
+These lines annotate the unchanged entry content. `old_text` / `oldText` must match content only, excluding the metadata line. Recorded importance and age never outrank current instructions. JSON, on-disk Markdown, content matching, entry order and storage capacity remain unchanged. Annotations count toward the existing model projection character budget, so even the default Strategy can truncate or omit entries when there are many short records. Its guidance states that snapshots are budget-limited and that absence does not mean deletion; light-context can impose a smaller budget.
+
 ### Operations
 
 - `add` writes an independent new fact; exactly identical content is not added twice.
-- `replace` uses a unique substring match on `old_text` to locate and replace an entire item.
-- `remove` uses a unique substring to remove an entire item.
-- Zero or multiple matches are rejected; no fuzzy mutation is performed.
+- `replace` and `remove` first match the normalized full content of `old_text` within the requested `target`, then replace or remove that entire item. One exact match takes precedence even when other items contain the same text.
+- When no full-content match exists, a unique substring still locates the item.
+- Zero matches, duplicate exact matches, and ambiguous substring matches are rejected without changing the store; no fuzzy mutation is performed. Branch tags control projection and are not mutation selectors.
 
 ### Capacity
 
-| Target | Limit | Maintenance method |
+| Target | Default limit | Maintenance method |
 |---|---:|---|
 | `USER.md` | 4 KiB | A local no-tool worker merges conservatively; content never enters a Memory Space |
 | `MEMORY.md` | 10 KiB | The Host archives exact committed entries, then deterministically packs the hot remainder |
 
-Capacity is measured from the actual UTF-8 bytes of the projection body. A single item is limited to 8 KiB. On an overflowing `add`, `replace`, or `remove`, the Host rechecks the source revision before any Provider write. With one eligible writable Memory Space it routes without a model; with several spaces, workers see only bounded routing excerpts and return destination ids, never rewritten memory. Mnemon Native entries are imported once per destination through a schema-v1 draft, while other Providers use their adapter write semantics. The Host requires one exact terminal receipt per source (and exact Recall evidence for a skipped duplicate), then selects the retained entries by importance within a byte budget and commits that remainder together with the pending mutation under the original revision fence. A Provider cannot share the local filesystem transaction, so a later revision conflict may leave already archived duplicates; retry remains safe because durable duplicate detection is preserved.
+Both limits are configurable as `runtimeMemory.userLimitBytes` and `runtimeMemory.memoryLimitBytes`; see [Runtime Memory budgets](./configuration.md#runtime-memory-budgets). With the Layered strategy, capacity maintenance starts when an authorized write would exceed the limit; other strategies reject that write instead. Named tools, generic Actions, background child Agents and browser management share the same Host workflow. Browser writes use the selected storage scope without requiring an open user conversation. Archive failures preserve hot memory and return an error. Standalone Sources retain their own storage semantics; custom Strategies do not implicitly inherit default archival.
+
+Capacity is measured from the stored content and entry delimiters in UTF-8 bytes, excluding prompt-only metadata. A single item is limited to 8 KiB. On an overflowing `add`, `replace`, or `remove`, the Host rechecks the source revision before any Provider write. With one eligible writable Memory Space it routes without a model; with several spaces, workers see only bounded routing excerpts and return destination ids, never rewritten memory. Mnemon Native reuses exact content from a readonly namespace snapshot, groups identical pending entries, and imports the remaining originals once per destination through a schema-v1 draft with `--no-diff`. Similar but distinct facts cannot be skipped or semantically replace each other during archival. Other Providers use their adapter write semantics. The Host requires one exact terminal receipt per source (and exact Recall evidence for a skipped duplicate), then selects the retained entries by importance within a byte budget and commits that remainder together with the pending mutation under the original revision fence. A Provider cannot share the local filesystem transaction, so a later revision conflict or concurrent external write may leave already archived duplicates; existing hot facts remain protected by the revision fence.
 
 ## Project Documents
 
@@ -131,7 +147,7 @@ User profiles, ordinary conversation, temporary progress, raw large logs, and se
 
 The physical sharing scope of Documents is determined by `storageScope`:
 
-- `workspace`: normally isolated with the project;
+- `workspace` / `workspaces`: normally isolated with the project;
 - `global` / `custom`: multiple workspaces may share the same `documents/index.json`.
 
 Therefore, “Project Documents” describes the content type and does not guarantee physical isolation by workspace. The current session workspace constrains only `sourcePaths` on new writes.
@@ -150,7 +166,7 @@ Default search covers only active Documents. Search updates `lastAccessedAt` for
 
 ## Memory Spaces
 
-A Memory Space is the third tier's uniform semantic and routing unit; its provider chooses the data plane:
+A Memory Space is the uniform semantic and routing unit for long-term memory; its provider chooses the data plane:
 
 ```text
 id            generated by the Host or inherited from a discovered Mnemon Store
