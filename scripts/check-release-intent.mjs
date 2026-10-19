@@ -36,10 +36,15 @@ export function assertReleaseIntentCoverage(changedPackages, releases) {
 /**
  * A package absent at the base revision is introduced by this change. It needs
  * a release intent like any changed package, but it first publishes with the
- * next release pull request, so it does not make this change a release.
+ * next release pull request, so it alone does not make a feature change a release.
+ * A change already advancing existing versions includes initial publications.
  */
 export function introducedPackageBaseVersions(packages, baseVersions) {
   const versions = new Map(baseVersions)
+  // A versioned sync/release also publishes packages absent from its base.
+  // Padding them would incorrectly classify their initial publication as unchanged.
+  if (packages.some(item => versions.has(item.manifest.name)
+    && versions.get(item.manifest.name) !== item.manifest.version)) return versions
   for (const item of packages) if (!versions.has(item.manifest.name)) versions.set(item.manifest.name, item.manifest.version)
   return versions
 }
