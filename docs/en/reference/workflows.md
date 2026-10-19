@@ -2,9 +2,11 @@
 
 [简体中文](../../zh-CN/reference/workflows.md) | **English** | [Documentation Center](../README.md)
 
+This page describes the **Layered strategy**, the default. The **General strategy** offers every available Source in one shared budget and leaves routing to the model: named tools serve their own Sources, and every other route is read with `mnemon_view_route` and changed with `mnemon_view_action`. It has no recall envelope beyond each route's own limits, no Runtime capacity maintenance or archival, and no idle review. See [Strategies and enhancements](../guides/capabilities.md#strategies-and-enhancements).
+
 ## Per-Turn Context
 
-The default composition provides stable routing guidance, a static Runtime Memory protocol, and a Wake snapshot message updated when needed:
+The Layered strategy provides stable routing guidance, a static Runtime Memory protocol, and a Wake snapshot message updated when needed:
 
 - `mnemon:routing`: a system prompt section that, when `routingGuidance=true`, provides concise boundaries for tiered queries;
 - `mnemon:runtime-memory-protocol`: a system prompt section containing the invariant Runtime Memory semantics and write rules. It is present only while the eager Runtime source participates in automatic projection and remains byte-identical across memory writes;
@@ -73,6 +75,8 @@ both attempts share at most 6 results, 1,200 characters each,
 and 4,800 total content characters for this executing Agent turn
 ```
 
+This admission envelope is the Layered strategy's per-turn policy; the General strategy applies only each route's own limits and call budget.
+
 The model-facing tool deliberately exposes no `category`, `source`, or `intent` filter: a guessed filter must not hide exact evidence. Recall is not forced: a root turn normally issues zero Provider queries. If the LLM calls it, the Host permits one initial query and at most one LLM-chosen, materially different refinement after evidence inspection. Same-query and concurrent repeats join or replay; a third distinct query replays the latest evidence without reaching a Provider. One Related traversal may follow, but only from a `memoryBodyId + id` admitted by either Recall attempt; its repeated result is replayed in the same way.
 
 Recall, Related and the single Documents search slot are budgeted per executing Agent turn. Parallel calls share that turn's state; sibling tasks, later turns and cold-resumed activations do not share cached evidence or consume each other's budget. Replays are restricted to the requested Memory Space subset. Document search is separately bounded to four records, 2,600 query-local characters per record, and 6,000 content characters total. The model-facing Memory Space catalog is capped at 16 entries, and `mnemon_status` returns only a compact health aggregate. Full records, provider settings, paths, and per-Space statistics remain available to Web/RPC control-plane surfaces, not conversation history.
@@ -135,9 +139,11 @@ request
   -> return compact receipt
 ```
 
-`replace` and `remove` must match exactly one item through `old_text`. Capacity maintenance is triggered only when the requested add or size-increasing replacement would exceed the target limit.
+`replace` and `remove` prefer a unique full-content match through `old_text` within the requested target; only when no exact match exists do they use a unique substring. Duplicate exact entries remain ambiguous. Capacity maintenance is triggered only when the requested add or size-increasing replacement would exceed the target limit.
 
 ## USER.md Capacity Maintenance
+
+Capacity maintenance and the MEMORY.md archival below are part of the Layered strategy. With the General strategy, a write that would exceed a Runtime limit is rejected instead.
 
 ```text
 USER add exceeds 4 KiB
@@ -173,21 +179,22 @@ The user profile is never sent to Memory Spaces. The worker has no tool permissi
 ## MEMORY.md Archival and Compaction
 
 ```text
-MEMORY add exceeds 10 KiB
+Layered strategy: pending MEMORY mutation exceeds the configured limit (10 KiB by default)
           |
           v
 snapshot revision + committed entries eligible for archival
 (exclude the pending add and the entry being replaced or removed)
           |
           v
-Host selects existing active writable Memory Spaces
+Host selects existing active writable Memory Spaces within this operation's Source and namespace scope
           |
           v
-spawn a no-tool planner
-  output: complete source-index routes + bounded compacted candidates
+One destination: Host routes directly
+Several destinations: independent no-tool worker returns source-index routes only
+  On model execution failure, Host falls back within eligible destinations
           |
           v
-Host validates exact source coverage, destinations, candidates, and byte budget
+Host validates exact source coverage, destinations, authority, and source revision
           |
           +-- invalid/revision changed -> no Provider writes; preserve Runtime
           |
@@ -195,6 +202,9 @@ Host validates exact source coverage, destinations, candidates, and byte budget
 Host writes each original entry exactly to its planned existing Space
   - committed receipt -> bind destination digest
   - skipped -> require exact Recall evidence
+          |
+          v
+Host retains exact hot entries by importance within its byte budget
           |
           v
 CAS compactAndMutate(revision, compaction, original mutation, lineage)
@@ -284,28 +294,36 @@ Host dirty admission
     >=600 assistant characters, or completed non-Mnemon work -> continue
       |
       v
-wait idleReviewMs (default 30 s)
+wait idleReviewMs (default 30 s), and at least
+idleReview.minIntervalMs (default 5 min) after the last attempt
       |
       +-- new turn --> cancel timer/worker, retain activity
       |
       v
-confirm Agent is idle and turn/end exists
+confirm the Agent is idle, turn/end exists, the turn was composed
+by the Layered strategy, and idleReview.maxPerSession is not reached
       |
       v
-fork completed parent checkpoint
+start a task Agent on the completed turn
+  - spawn (default): a bounded checkpoint, idleReview.maxContextChars
+  - fork: inherits the parent context
       |
       v
-conservative maintenance decision
-  - at most one hot-memory mutation by persona
-  - at most one Document create/update by persona
-  - no direct long-term remember/forget tools
+conservative maintenance decision, one layer per pass
+  - Documents first: search; create at most one separate document
+    for a project record, never update or archive an existing one
+  - hot memory: only new, explicit, durable user assertions;
+    MEMORY.md takes compact rules no Document covers, never
+    project records (off with idleReview.runtimeMemory: false)
+  - after a Document, working memory is refused, and vice versa
+  - no Memory Spaces write tools
       |
       +-- completed, including skip -> clear activity
       |
       +-- failed/aborted ------------> retain activity
 ```
 
-The admission check is deliberately structural rather than an LLM classification, so an eligible but ordinary checkpoint starts no background model. “At most one” is currently enforced by the worker persona, not by a Host mutation counter. Background watermarks are not yet persisted, so a Host restart loses accumulated signals that have not been processed.
+The admission check is deliberately structural rather than an LLM classification, so an eligible but ordinary checkpoint starts no background model. The review Agent's tools are exactly `mnemon_document_search`, `mnemon_runtime_memory` and `mnemon_document_create`, without the runtime tool when `idleReview.runtimeMemory` is `false`. The review guard holds each pass to one layer: the first Document creation or working-memory change it admits claims the pass, and the other is refused even if that first call fails; USER.md changes stay independent. “At most one” document or hot-memory change is still enforced by the persona, not by a Host mutation counter. Memory Spaces receive review output only later, through working-memory capacity archiving and Document cold archiving. While Agent Teams tools are installed, review pauses unless `idleReview.agentTeams: scoped`; the Status page says so while it is paused. Background watermarks are not yet persisted, so a Host restart loses accumulated signals that have not been processed.
 
 ## How Configuration Switches Interact
 

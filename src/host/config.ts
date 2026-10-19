@@ -1,6 +1,8 @@
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
+import { DEFAULT_IDLE_REVIEW } from './protocol.ts'
 import { isAbsolute } from 'node:path'
 import { normalizeDisplayMode } from './display-mode.ts'
+import { schema as MemoryViewConfig, preferences as validateMemoryViewPreferences } from './view-preferences.ts'
 import { resolveEmbedding, resolvePersistenceStrategy, resolveRecallQuality } from 'dsh-mnemon-source-memory-spaces'
 
 export { resolveEmbedding, resolvePersistenceStrategy, resolveRecallQuality } from 'dsh-mnemon-source-memory-spaces'
@@ -114,6 +116,18 @@ const RuntimeMemorySchema: z<RuntimeMemoryConfig> = z.object({
   maintenanceMaxTokens: z.number().step(1).min(1).max(MAX_RUNTIME_MAINTENANCE_MAX_TOKENS).default(DEFAULT_RUNTIME_MAINTENANCE_MAX_TOKENS),
 })
 
+const IdleReviewSchema = z.object({
+  enabled: z.boolean().default(DEFAULT_IDLE_REVIEW.enabled),
+  runtimeMemory: z.boolean().default(DEFAULT_IDLE_REVIEW.runtimeMemory),
+  provider: z.union(['spawn', 'fork'] as const).default(DEFAULT_IDLE_REVIEW.provider),
+  fallback: z.union(['spawn', 'skip'] as const).default(DEFAULT_IDLE_REVIEW.fallback),
+  agentTeams: z.union(['pause', 'scoped'] as const).default(DEFAULT_IDLE_REVIEW.agentTeams),
+  minIntervalMs: z.number().step(1).min(5_000).max(86_400_000).default(DEFAULT_IDLE_REVIEW.minIntervalMs),
+  maxPerSession: z.number().step(1).min(0).max(200).default(DEFAULT_IDLE_REVIEW.maxPerSession),
+  maxContextChars: z.number().step(1).min(1_000).max(1_000_000).default(DEFAULT_IDLE_REVIEW.maxContextChars),
+  maxTokens: z.number().step(1).min(128).max(131_072).default(DEFAULT_IDLE_REVIEW.maxTokens),
+})
+
 const MemoryParticipationModeSchema = z.union(['off', 'manual', 'automatic'] as const)
 const MemoryLayerConfigSchema = z.object({
   enabled: z.boolean(),
@@ -137,7 +151,7 @@ export const Config: z<Config> = z.object({
   // Source/Strategy Entries without double registration.
   // Keep this optional in the schema so legacy dataDir-only installs still
   // resolve to the custom scope instead of being silently reset to global.
-  storageScope: z.union(['global', 'workspace', 'custom'] as const),
+  storageScope: z.union(['global', 'workspace', 'custom', 'workspaces'] as const),
   runtimeUserScope: z.union(['storage', 'global'] as const).default('storage'),
   cliPath: z.string(),
   dataDir: z.string(),
@@ -163,6 +177,8 @@ export const Config: z<Config> = z.object({
     protocol: DEFAULT_EMBEDDING_PROTOCOL,
   }),
   memoryTopology: MemoryTopologySchema,
+  memoryView: MemoryViewConfig,
+  legacySettingsImported: z.boolean(),
   recallQuality: RecallQualitySchema.default({
     policy: DEFAULT_RECALL_QUALITY_POLICY,
     lowScoreThreshold: DEFAULT_RECALL_LOW_SCORE_THRESHOLD,
@@ -181,6 +197,7 @@ export const Config: z<Config> = z.object({
   recallMode: z.union(['guided', 'off'] as const).default('guided'),
   writebackMode: z.union(['guided', 'off'] as const).default('guided'),
   idleReviewMs: z.number().step(1).min(5_000).max(600_000).default(DEFAULT_IDLE_REVIEW_MS),
+  idleReview: IdleReviewSchema.default(DEFAULT_IDLE_REVIEW),
   // Conversation surfaces default on and remain independently switchable live.
   conversationInteraction: z.object({
     toolviews: z.boolean().default(false),
@@ -208,6 +225,7 @@ const CUSTOM_PACK_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/
 function validateCustomDataDir(value: string): string {
   const dataDir = optionalText(value)
   if (dataDir === undefined) throw new Error('dsh-mnemon: custom Pack dataDir is required')
+  if (dataDir.includes('\0')) throw new Error('dsh-mnemon: dataDir must not contain a null byte')
   if (!isAbsolute(dataDir) && dataDir !== '~' && !dataDir.startsWith('~/')) {
     throw new Error('dsh-mnemon: custom Pack dataDir must be absolute or start with ~/')
   }
@@ -303,6 +321,7 @@ function resolveMemoryTopology(value: MemoryTopologyConfig | undefined): SharedR
 }
 
 export function resolveConfig(config: Config = {}): ResolvedConfig {
+  if (config.memoryView !== undefined) validateMemoryViewPreferences(config.memoryView)
   const cliPath = optionalText(config.cliPath)
   const legacyDataDir = optionalText(config.dataDir)
   const legacyPacks = resolveCustomPacks(config.customPacks, legacyDataDir)
@@ -310,6 +329,7 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   if (requestedPackId !== undefined && !CUSTOM_PACK_ID.test(requestedPackId)) throw new Error('dsh-mnemon: customPackId is invalid')
   const store = optionalText(config.store)
   const storageScope = config.storageScope ?? (legacyDataDir === undefined && legacyPacks.length === 0 ? 'global' : 'custom')
+  if (!['global', 'workspace', 'custom', 'workspaces'].includes(storageScope)) throw new Error('dsh-mnemon: unsupported storageScope')
   const runtimeUserScope = config.runtimeUserScope ?? 'storage'
   if (runtimeUserScope !== 'storage' && runtimeUserScope !== 'global') throw new Error(`dsh-mnemon: unsupported Runtime USER.md scope: ${String(runtimeUserScope)}`)
   const selectedPack = requestedPackId === undefined
@@ -342,6 +362,7 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     recallMode: config.recallMode ?? 'guided',
     writebackMode: config.writebackMode ?? 'guided',
     idleReviewMs: config.idleReviewMs ?? DEFAULT_IDLE_REVIEW_MS,
+    idleReview: IdleReviewSchema(config.idleReview ?? {}),
     conversationInteraction: {
       toolviews: config.conversationInteraction?.toolviews ?? false,
       turnBar: config.conversationInteraction?.turnBar ?? true,

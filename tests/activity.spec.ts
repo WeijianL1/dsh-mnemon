@@ -81,10 +81,29 @@ describe('TurnActivityProjection', () => {
     expect(JSON.stringify(projection.snapshot(events))).not.toContain('credential')
   })
 
+  it('names a removal by the text it removed and an item without text only by its id', () => {
+    const removed = memoryWritePresentation('runtime', 'mutate')({ action: 'remove', target: 'memory', old_text: 'Checkout p75 LCP target is 2.5 s.' }, { success: true })
+    const forgotten = memoryWritePresentation('memory-spaces', 'forget')({ id: 'memory-7', memoryBodyId: 'lumen' }, { success: true })
+    expect(removed).toMatchObject({ item: { id: 'mutate', title: 'Checkout p75 LCP target is 2.5 s.' } })
+    expect(forgotten).toMatchObject({ item: { id: 'memory-7', title: 'memory-7' } })
+  })
+
   it('resets when the durable event log is replaced by a shorter session', () => {
     const projection = new TurnActivityProjection()
     projection.snapshot([call(1, 1, 'first', 'mnemon_recall'), result(2, 1, 'first')])
 
     expect(projection.snapshot([call(1, 2, 'second', 'mnemon_status')])).toEqual({ cursor: 1, activities: [] })
+  })
+
+  it('records a committed create-only Document as a visible document writeback', () => {
+    const projection = new TurnActivityProjection()
+    const meta = memoryWritePresentation('documents', 'create')({ title: 'Rollout follow-up', content: 'Separate new evidence.' }, {
+      action: 'created', memoryReceipt: { status: 'succeeded', completion: 'committed', committedAt: '2026-09-08T00:00:00.000Z' },
+    })
+    const events = [call(1, 1, 'created', 'mnemon_document_create'), result(2, 1, 'created', false, meta)]
+    expect(projection.snapshot(events).activities[0]).toMatchObject({
+      writes: 1, names: ['mnemon_document_create'], writebacks: [{ toolName: 'mnemon_document_create', sourceTypeId: 'documents',
+        operationId: 'create', item: { title: 'Rollout follow-up', excerpt: 'Separate new evidence.' } }],
+    })
   })
 })

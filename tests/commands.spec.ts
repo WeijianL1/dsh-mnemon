@@ -56,6 +56,19 @@ describe('/mnemon command', () => {
     expect(service.status).toHaveBeenCalledOnce()
   })
 
+  it('reports Mnemon Native as optional when its CLI is missing', async () => {
+    const service = {
+      config: { writeEnabled: true, defaultRecallLimit: 10 },
+      status: vi.fn(async () => ({
+        healthy: true, commandFound: false, cliPath: 'mnemon', dataDir: '/tmp/mnemon', mnemonDefaultStore: 'default',
+        dshActiveStores: ['mem0-notes'], writeEnabled: true, defaultRecallLimit: 10, stats: { totalInsights: 4, edgeCount: 0, deletedInsights: 0 },
+      })),
+    }
+    const result = await createMnemonCommand(runtime(service), coordinator()).handler(invocation('status'))
+    expect(result).toEqual(expect.objectContaining({ kind: 'success', text: expect.stringMatching(/^Mnemon Native: 未安装 CLI[\s\S]*DSH 已激活: mem0-notes[\s\S]*有效记忆: 4/u) }))
+    expect((result as { text: string }).text).not.toContain('CLI: mnemon')
+  })
+
   it('runs a bounded recall and includes full ids', async () => {
     const service = {
       config: { writeEnabled: true, defaultRecallLimit: 20 },
@@ -82,5 +95,24 @@ describe('/mnemon command', () => {
     }
     const result = await createMnemonCommand(runtime(service), coordinator()).handler(invocation('remember 一条稳定记忆'))
     expect(result).toEqual({ kind: 'success', text: 'Mnemon 记忆 Agent 已处理：stored · 记忆空间 project' })
+  })
+
+  it('reports an explicit forget only after a forgotten receipt', async () => {
+    const memoryCoordinator = coordinator()
+    const result = await createMnemonCommand(runtime({ config: { writeEnabled: true, defaultRecallLimit: 10 } }), memoryCoordinator)
+      .handler(invocation('forget memory-exact-id'))
+    expect(memoryCoordinator.write).toHaveBeenCalledWith(agent, 'forget', { id: 'memory-exact-id' }, expect.any(AbortSignal))
+    expect(result).toEqual({ kind: 'success', text: '已软删除 Mnemon 记忆：memory-exact-id' })
+  })
+
+  it.each(['skipped', 'failed', 'accepted', 'unknown'])('does not report deletion after a %s worker receipt', async action => {
+    const memoryCoordinator = coordinator({ write: vi.fn(async () => ({
+      delegated: true as const, runId: 'child-1', provider: 'spawn', summary: 'No deletion was committed.', action, memoryBodyIds: [],
+    })) })
+    const result = await createMnemonCommand(runtime({ config: { writeEnabled: true, defaultRecallLimit: 10 } }), memoryCoordinator)
+      .handler(invocation('forget memory-exact-id'))
+    expect(result.kind).toBe('error')
+    expect(result.text).toContain('No deletion was committed.')
+    expect(result.text).not.toContain('已软删除')
   })
 })

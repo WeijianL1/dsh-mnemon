@@ -4,21 +4,34 @@
 
 ## Configuration Location and Activation
 
-The plugin registers the `mnemon` namespace with the DSH settings service. User configuration is stored in:
+The configuration is the `mnemon` entry of the DSH profile. DSH's settings service writes user values into the profile patch:
 
 ```text
-$DSH_HOME/settings.yaml
+$DSH_HOME/profiles/<profile>/cordis.patch.yml
 ```
 
-The default is commonly `~/.dsh/settings.yaml`. All current settings are marked `live`; after Save, the Host initializes a candidate runtime graph and then switches to it atomically.
+The Web profile's patch is commonly `~/.dsh/profiles/web/cordis.patch.yml`. A `settings.yaml` left by an older host is imported into the profile once and kept as `settings.yaml.imported`; see [DSH 0.1.7 settings recovery](./compatibility.md#dsh-017-settings-recovery). All current settings are marked `live`; after a change is applied, the Host initializes a candidate runtime graph and then switches to it atomically.
 
-The Web settings page edits `storageScope`, the independent `runtimeUserScope`, `dataDir`, Mnemon Native's Ollama embedding override, one master switch for each of the three memory Sources, the background task Agent model route, and the Turn memory and Save-to-memory switches under `mnemon-ui`. Global and Workspace define the scope of the complete memory system; the USER.md profile may explicitly remain global while project memory follows that scope. Mnemon Native owns its Custom data location, embedding runtime, and ZIP backup/migration controls. Each external provider has a collapsible service configuration for reusable endpoints, credentials, or executables. Enabling or saving it discovers the provider's existing namespaces and maps them into Memory Spaces → Overview; disabling it removes those local mappings without deleting provider data. Other advanced settings must be changed directly in YAML.
+As DSH 0.1.7 does for every plugin that carries its own configuration, the Web interface edits Mnemon's settings on its page under **Plugins**, not in Settings. The [UI guide](../guides/ui-guide.md#on-the-plugins-page) shows each part.
+
+| Where in the UI | Settings | Saved as |
+|---|---|---|
+| Memory composition | Main strategy; one switch per memory source and enhancement; each component's declared options | `memoryView.strategyTypeId` and `memoryView.entries.<entry>.config`; each component's on/off is its Entry's `disabled` row, written by DSH's plugin manager |
+| Storage | Storage scope, data directory, backup and migration | `storageScope`, `dataDir` |
+| Interface | Memory System opens in, turn memory bar, save to memory | `displayMode`, `conversationInteraction.turnBar`, `conversationInteraction.saveAction` |
+| Runtime memory's page | User profile scope | `runtimeUserScope` |
+| Memory Spaces' page | Memory providers; Mnemon Native embedding (auto, Ollama or OpenAI-compatible) | The Provider registry in `state/memory-providers.json`; `embedding` |
+| Layered strategy's page | Task Agent model; idle review | `taskAgentModel`; `idleReview` |
+
+Switches and selectors apply at once; typed values such as the storage directory, the embedding connection, review limits and component options wait for **Apply**. A Provider's reusable service fields (endpoints, credentials, executables) live in the Provider registry, not in Mnemon's YAML; enabling or saving a Provider discovers its namespaces into **Memory Spaces → Overview**, and turning it off removes only those local mappings. Other advanced settings are edited in YAML.
+
+OpenViking user keys without admin access can opt into one-owner discovery using the service field `discoveryUser` together with `endpoint`, `apiKey`, and `account`. Leave it empty to retain admin enumeration. These service fields stay in the Memory Spaces provider registry; they are not new top-level Mnemon YAML settings. See [OpenViking setup and compatibility](../guides/memory-providers.md#operational-boundaries).
 
 ## Complete Example
 
 ```yaml
 mnemon:
-  storageScope: global # global | workspace | custom
+  storageScope: global # global | workspace | custom | workspaces
   runtimeUserScope: storage # storage | global
   # dataDir: ~/mnemon-data       # required for custom
   # cliPath: /opt/homebrew/bin/mnemon
@@ -50,22 +63,32 @@ mnemon:
   recallMode: guided
   writebackMode: guided
   idleReviewMs: 30000
+  idleReview:
+    enabled: true
+    runtimeMemory: true # false: Documents only
+    provider: spawn
+    fallback: spawn
+    agentTeams: pause # pause | scoped
+    minIntervalMs: 300000
+    maxPerSession: 20
+    maxContextChars: 24000
+    maxTokens: 4096
   tabEnabled: true
   writeEnabled: true
   taskAgentModel:
     mode: inherit # inherit | fixed
     # provider: deepseek # required for fixed
     # model: deepseek-chat # required for fixed
-  remoteAccess: read-only # rc.2 only: read-only | trusted-host
+  remoteAccess: read-only # remote management: read-only | trusted-host
 ```
 
 ## Options
 
 | Setting | Default | Range | Implementation Semantics |
 |---|---:|---|---|
-| `storageScope` | `global` | `global` / `workspace` / `custom` | Controls the root for Runtime, Documents, Memory Spaces, and reserved state as one unit |
+| `storageScope` | `global` | `global` / `workspace` / `custom` / `workspaces` | Controls the root for Runtime, Documents, Memory Spaces, and reserved state as one unit |
 | `runtimeUserScope` | `storage` | `storage` / `global` | Keeps USER.md in the selected storage root, or overlays the global USER.md while project MEMORY.md and the other layers stay selected-scope |
-| `dataDir` | unset | absolute path, `~`, or `~/...` | Required for `custom`; legacy configurations that set only this option automatically resolve to `custom` |
+| `dataDir` | unset | absolute path, `~`, or `~/...` | Required for `custom`; optional central root for `workspaces`; legacy configurations that set only this option automatically resolve to `custom` |
 | `cliPath` | auto-discovered | executable path | Explicitly selects the Mnemon CLI |
 | `store` | unset | `[A-Za-z0-9][A-Za-z0-9_-]*` | Compatibility discovery/preference hint for legacy Stores; semantic operations are routed through Memory Spaces |
 | `timeoutMs` | `10000` | 100–120000 ms | Hard timeout for a single CLI call |
@@ -74,7 +97,11 @@ mnemon:
 | `runtimeMemory.userLimitBytes` | `4096` | 1–1048576 bytes | UTF-8 byte limit for the complete `USER.md` projection |
 | `runtimeMemory.maintenanceMaxTokens` | `8192` | 1–1000000 tokens | Completion-token budget for Runtime migration and compaction workers; does not change Document archive or metadata-maintenance budgets |
 | `embedding` | `{ enabled: false, endpoint: http://localhost:11434, model: nomic-embed-text, apiKey: '', protocol: auto }` | enabled + HTTP(S) endpoint + model + optional apiKey + protocol (auto/ollama/openai) | When enabled, the Host injects the saved endpoint, model, API key, and protocol override into every Mnemon CLI child process; an endpoint ending in `/v1` makes Mnemon use the OpenAI-compatible protocol with the API key as a Bearer token, and `protocol: openai` forces it for non-`/v1` endpoints; when disabled, existing Host environment and Mnemon defaults remain untouched |
-| `memoryTopology.layers.<id>.enabled` | `true` for the three defaults | boolean | Whether the Source participates; disabling never deletes or migrates existing data |
+| `memoryTopology.layers.<id>.enabled` | `true` for the three defaults | boolean | Legacy layer flag. A Source's switch on the board turns its DSH Entry on or off and turns this flag back on with it; the flag is used when the components cannot be read. Turning a Source off never deletes or migrates data |
+| `memoryTopology.layers.<id>.participation` | per layer | `off` / `manual` / `automatic` for `recall`, `write`, `projection`, `maintenance` | How a layer takes part in each kind of work under the Layered strategy |
+| `memoryView.strategyTypeId` | unset | Strategy type id, for example `default-three-tier` or `general` | The selected main strategy, written by the **Main strategy** selector; overrides `memoryTopology.strategyId` |
+| `memoryView.entries.<entry>.config` | `{}` | the options a component declares | Options saved from a component's page. On/off is not stored here: DSH's plugin manager writes it as the Entry's `disabled` row in the profile patch, and earlier saved choices are moved there once |
+| `persistenceStrategy` | `{ mode: manual }` | `manual` / `automatic`, `providerId`, `prompt`, `rules` | Provider for new spaces: when a task Agent creates a Memory Space, one fixed Provider, or smart selection with allowed Providers, data boundary, required capabilities and preference; existing spaces are still chosen by name and description |
 | `recallQuality.policy` | `strict-v1` | registered policy id | Deterministic policy applied before recall content is serialized to an Agent or client |
 | `recallQuality.lowScoreThreshold` | `0.25` | 0–1, below high threshold | Normalized scores below this boundary are removed by `strict-v1` |
 | `recallQuality.highScoreThreshold` | `0.6` | 0–1, above low threshold | Retained normalized scores at or above this boundary are labeled high relevance |
@@ -86,15 +113,24 @@ mnemon:
 | `recallMode` | `guided` | `guided` / `off` | Whether to inject one durable on-demand recall cue per session; does not remove explicit recall |
 | `writebackMode` | `guided` | `guided` / `off` | Whether to inject one durable hot-memory cue per session and enable scored, dirty-admitted background review; does not remove explicit writes |
 | `idleReviewMs` | `30000` | 5000–600000 ms | Required continuous idle time after the threshold is reached |
-| `displayMode` | `sidebar` | `sidebar` / `builtin`; legacy `buildin` accepted | Entry placement: standalone Sidebar or a conversation tab using the same workspace UI; legacy spelling is migrated to `builtin` |
+| `idleReview.enabled` | `true` | boolean | Independent automatic-review switch |
+| `idleReview.runtimeMemory` | `true` | boolean | Lets review change runtime memory (USER.md and MEMORY.md); `false` limits it to creating Documents |
+| `idleReview.provider` | `spawn` | `spawn` / `fork` | Bounded checkpoint or inherited parent context |
+| `idleReview.fallback` | `spawn` | `spawn` / `skip` | Missing/incompatible fork handling before startup only |
+| `idleReview.agentTeams` | `pause` | `pause` / `scoped` | Pause while Team tools are installed or explicitly allow guarded review; verified with DSH/Teams 0.1.7-rc.2 |
+| `idleReview.minIntervalMs` | `300000` | 5000–86400000 ms | Minimum interval between attempts |
+| `idleReview.maxPerSession` | `20` | 0–200 | Attempt cap per loaded parent Agent; includes failures/cancellations |
+| `idleReview.maxContextChars` | `24000` | 1000–1000000 | Spawn checkpoint character limit |
+| `idleReview.maxTokens` | `4096` | 128–131072 | Per-response model output limit |
+| `displayMode` | `sidebar` | `sidebar` / `builtin`; legacy `buildin` accepted | Where the Memory System opens: standalone Sidebar or a conversation tab using the same workspace UI; legacy spelling is migrated to `builtin` |
 | `tabEnabled` | `true` | boolean | Whether to mount the selected entry and workbench; Host RPC, commands, and Agent tools remain registered when off |
 | `writeEnabled` | `true` | boolean | Whether to expose semantic write tools, write RPC, and write commands |
-| `taskAgentModel` | `{ mode: inherit }` | `inherit` / `fixed` | Model route for independent task Agents used by AI metadata, Agent Query, memory distillation, and Document archiving, plus the idle-review worker; `fixed` requires both `provider` and `model` and also pins their bounded workers for write, answer, provider placement, migration, compaction, archive, and metadata maintenance. Conversation Recall and Related are direct Host reads and do not use this route |
-| `remoteAccess` | `read-only` | `read-only` / `trusted-host` | Startup-only DSH 0.1.1-rc.2 rollback policy for non-loopback Mnemon management RPC; ignored by DSH 0.1.2-alpha.5 and 0.1.2-rc.1 |
-| `mnemon-ui.turnBar` | `true` | boolean | Turn-tail memory activity bar; on by default, **applies live after saving** |
-| `mnemon-ui.saveAction` | `true` | boolean | “Save to memory” icon and confirmation on finalized assistant replies; on by default, **applies live after saving** |
+| `taskAgentModel` | `{ mode: inherit }` | `inherit` / `fixed` | Model route for independent task Agents used by Tidy names and descriptions, Ask Agent, Save to memory, and Document archiving, plus the idle-review worker; `fixed` requires both `provider` and `model` and also pins their bounded workers for write, answer, provider placement, migration, compaction, archive, and metadata maintenance. Conversation Recall and Related are direct Host reads and do not use this route |
+| `remoteAccess` | `read-only` | `read-only` / `trusted-host` | Startup-only grant for non-loopback Mnemon management, enforced by the API Gateway projection |
+| `conversationInteraction.turnBar` | `true` | boolean | The turn memory bar under replies; applies at once |
+| `conversationInteraction.saveAction` | `true` | boolean | The **Save to memory** action and confirmation on finished replies; applies at once |
 
-Both the `mnemon` Host/storage namespace and the `mnemon-ui` browser-presentation namespace apply live. The storage root switches atomically only after the new runtime graph initializes successfully. Legacy `mnemon.conversationInteraction` values remain a migration default, but new saves write only to `mnemon-ui`.
+Every value is saved under the `mnemon` entry and applies live. The UI's `mnemon-ui` settings scope is stored as `conversationInteraction`, and its `mnemon-view` scope as `memoryView`. The storage root switches atomically only after the new runtime graph initializes successfully.
 
 ### Runtime Memory budgets
 
@@ -110,9 +146,11 @@ mnemon:
 
 The defaults preserve the released 10240 / 4096 / 8192 behavior. Saving the block builds a new runtime generation, so subsequent Runtime reads, writes, capacity maintenance, and Mnemon Pack validation use the same limits. Existing entries and the `memories.json` format are unchanged. Lowering a byte limit below current usage does not delete data; the Runtime view reports the over-capacity state and further writes require compaction or a higher limit. Rollback only requires removing the block or restoring the defaults.
 
-The isolated DSH Web comparison below shows the default USER 4.0 KB / MEMORY 10.0 KB limits first, followed by the active USER 10.0 KB / MEMORY 20.0 KB configuration. Both captures use an empty temporary root and contain no private memory.
+Storage byte limits count entry content and delimiters. The model snapshot's importance and age annotations do not consume storage capacity; they do consume the Strategy's existing projection character budget. They add no ranking, relevance filter or separate configuration.
 
-[![Runtime Memory default and configured capacity comparison](../../assets/screenshots/runtime-memory-capacity-configuration.png)](../../assets/screenshots/runtime-memory-capacity-configuration.png)
+The Runtime memory page shows each file's size against its limit.
+
+![Runtime memory with USER.md and MEMORY.md against their default limits](../../assets/webui-v0.5.19/en/memory-runtime.jpg)
 
 ### Mnemon Native embeddings
 
@@ -144,15 +182,13 @@ The endpoint must be an absolute HTTP(S) URL without credentials, query paramete
 
 ### Memory Source switches
 
-Each Source has one master switch. `enabled=true` permits the default strategy to use the Source when needed; it does not force recall or writes on every turn. `enabled=false` stops that Source's context injection, model calls, background processing, and data-plane Web/RPC operations together.
+Each memory Source has one switch in **Memory composition**. It turns the Source's DSH Entry on or off through DSH's plugin manager, which saves the choice as the Entry's `disabled` row in the profile patch. On permits the main strategy to use the Source when needed; it does not force recall or writes on every turn. Off stops that Source's context injection, tools, background work and data-plane Web and RPC operations together.
 
-[![The isolated English v0.3 settings page gives each default Memory Source one master switch](../../assets/screenshots/settings-memory-layers-en.jpg)](../../assets/screenshots/settings-memory-layers-en.jpg)
+![Memory composition with one switch per memory Source and enhancement](../../assets/webui-v0.5.19/en/plugin-composition.jpg)
 
-Disabling is reversible routing state, not deletion. The corresponding Sidebar tab remains visible with an Off badge and does not read the data plane; Status, Catalog, and management directories remain observable. Re-enabling uses the original directories and data.
+Turning a Source off is reversible routing state, not deletion. Its Memory System page stays, marked **Not running**, and does not read the data plane; Status and the management directories stay observable. Turning it on again uses the original directories and data. The last running Source cannot be turned off. The legacy `memoryTopology.layers.<id>.enabled` flag is turned back on with the Source and is used only when the components cannot be read.
 
-[![The actual English Sidebar after disabling Documents: its tab remains while data is neither read nor deleted](../../assets/screenshots/sidebar-layer-disabled-en.jpg)](../../assets/screenshots/sidebar-layer-disabled-en.jpg)
-
-The WebUI reads Source instances from the live management catalog; no frontend enum is required for a new Source. The existing `memoryTopology.layers` keys remain configuration input, not a second Source runtime. Source type ids select configuration; a Strategy selects exact instance keys. Settings update under a revision fence, and candidate compilation must succeed before replacement. Core and Source boundaries recheck capability, scope and current authority.
+The WebUI reads Source instances from the live management catalog, so a new Source needs no frontend change. Source type ids select configuration; a Strategy selects exact instance keys. Settings update under a revision fence, and candidate compilation must succeed before replacement. Core and Source boundaries recheck capability, scope and current authority.
 
 ### Recall quality policies
 
@@ -162,13 +198,9 @@ These pure recall-quality policies belong to the Memory Spaces Source. Configura
 
 ### Browser authentication
 
-One branch-free registration path supports the stable DSH 0.1.2-rc.1 baseline, its alpha.5 predecessor, and the previous 0.1.1-rc.2 line. Mnemon always supplies the trailing authority object required by rc.2; the 0.1.2 two-argument JavaScript implementation naturally ignores it, so no package-version check or capability branch is involved.
+DSH owns browser authentication or pairing and Host/Origin validation. Remote pages use the namespaced API Gateway; local loopback clients and DSH desktop windows (`dsh-app://app/`) use their own channels, and an application page counts as remote only when DSH declares a transport for it that does not own the Host. Mnemon's Gateway projection separately enforces `remoteAccess`: `read-only` allows ordinary reads, narrow activation and settings inspection, but rejects writes, ZIP operations, View mutations and settings changes. Settings snapshots report `writable: false` without the `trusted-host` grant. Restart DSH after changing this startup-only policy. DSH `trustedHosts` does not replace HTTPS or deployment access controls. `writeEnabled=false` is a product-level read-only mode, not a substitute for transport authentication.
 
-DSH 0.1.2-rc.1 and alpha.5 authenticate every Mnemon RPC through the browser session established from the Host's launch-token URL and signed, authority-bound cookie. They ignore `remoteAccess`, which remains accepted solely so the same plugin configuration can roll back to rc.2 safely. DSH `trustedHosts` remains a Host/Origin fence, not a replacement for HTTPS or deployment access controls.
-
-On DSH 0.1.1-rc.2, `remoteAccess` remains a real startup security boundary and cannot be changed through Web settings. The default `read-only` mode keeps settings, ZIP backups, Provider connections, and broad mutations loopback-only; `trusted-host` promotes all three management channels together and must be used only behind reliable deployment authentication. `writeEnabled=false` is a product-level read-only mode on every supported version; it is not a substitute for transport authentication.
-
-For the complete proxy, launch-token, trusted-authority, rc.2 rollback-patch, restart, and verification workflow, see [Cloud-hosted WebUI](../guides/operations.md#cloud-hosted-webui).
+For the complete proxy, launch-token, trusted-authority, restart and verification workflow, see [Cloud-hosted WebUI](../guides/operations.md#cloud-hosted-webui).
 
 ## Storage Scopes
 
@@ -188,13 +220,13 @@ Agent / tool / lifecycle: resolve(currentSession.header.cwd, ".mnemon")
 Web workbench inspection: resolve(workspaceRegistry.get(selectedWorkspaceId).path, ".mnemon")
 ```
 
-Each DSH workspace owns an independent three-tier memory root. Conversation Agents, model tools, commands, and lifecycle hooks route by the current session cwd. Independent task Agents launched from the Web workbench instead use the selected Host-registered workspace explicitly; the browser can never submit an arbitrary path. AI metadata, Agent Query, memory distillation, and document archiving therefore target the workspace selected at the top left even when no main session is selected.
+Each DSH workspace owns an independent memory root for runtime memory, documents and memory spaces. Conversation Agents, model tools, commands, and lifecycle hooks route by the current session cwd. Independent task Agents launched from the Web workbench instead use the selected Host-registered workspace explicitly; the browser can never submit an arbitrary path. Tidy names and descriptions, Ask Agent, Save to memory, and document archiving therefore target the workspace selected in the Memory System header, even when no main session is selected.
 
 Headless has no `workspaceRegistry`; its fresh session cwd is the directory from which `dsh --profile headless ...` was launched, so `workspace` resolves directly to `<invocation cwd>/.mnemon`.
 
 ### Global USER.md with workspace project memory
 
-To share user-level collaboration requirements across repositories while keeping project facts isolated, select **Workspace** plus **Global user profile**, or configure:
+To share user-level collaboration requirements across repositories while keeping project facts isolated, set Storage scope to **Workspace** on the `dsh-mnemon` page and User profile scope to **Shared globally** on Runtime Memory's page, or configure:
 
 ```yaml
 mnemon:
@@ -205,6 +237,23 @@ mnemon:
 Each turn then projects `USER.md` from the global root (`MNEMON_DATA_DIR` when set, otherwise `~/.mnemon`) together with `MEMORY.md` from `<workspace>/.mnemon`. `target=user` mutations and local USER.md compaction go only to the global source; `target=memory`, Documents, Memory Spaces, and Provider state remain workspace-scoped. Global MEMORY.md and workspace USER.md entries stay intact on disk but are not projected in this mode.
 
 Changing this setting never copies, merges, or deletes entries. Switching back to `runtimeUserScope: storage` reveals the selected root's original USER.md again. A Mnemon Pack still represents one selected storage root, so a workspace Pack does not silently include the separate global USER.md; back up the global root separately when that profile is important.
+
+### `workspaces`
+
+This built-in mode is available with the Starter; no additional plugin is required. Select **Centralized · isolated by workspace** as the Storage scope; to set a central root of your own, choose **Custom** under the same group's **Data directory**.
+
+```yaml
+mnemon:
+  storageScope: workspaces
+  dataDir: ~/central-memory # optional; otherwise MNEMON_DATA_DIR or ~/.mnemon
+  runtimeUserScope: global # optional; share only USER.md
+```
+
+All four areas (`runtime`, `data`, `documents`, `state`) live under `<central-root>/workspaces/<sha256(canonical-workspace-path)>/`. Existing symlink aliases resolve to the same ID; different workspace paths remain isolated. A move or rename selects a new ID, with no automatic migration. Sidebar inspection follows the selected registered workspace; the conversation tab and Headless follow the owning session cwd. Global USER.md still uses `MNEMON_DATA_DIR` or `~/.mnemon`, even when the central root is customized.
+
+Workspace identity resolution allows not-yet-created directory descendants, including Unicode names and descendants below a symlink alias. A path below an existing file is rejected with `ENOTDIR` on every platform, including Windows, before a storage ID is computed. This does not change valid IDs or move, rewrite or remove existing storage.
+
+Changing scopes never migrates, merges or deletes an old root. A ZIP Pack still contains only the selected workspace root; back up the whole central directory to preserve all workspaces. Remote Provider namespaces retain their own sharing semantics.
 
 ### `custom`
 
@@ -226,7 +275,7 @@ mnemon:
 
 Mnemon Native interoperates with other Mnemon-enabled agents through `data/<store>/mnemon.db`; third-party engines interoperate through their configured provider scope. Runtime, Documents, DSH activation state, and UI metadata remain managed by dsh-mnemon. See [Long-term memory providers](../guides/memory-providers.md).
 
-External service settings, Memory Space scope settings, and secrets are stored in `state/memory-providers.json` under the selected scope root, not in `settings.yaml`. Multiple Memory Spaces reuse one provider service configuration; the Host merges both layers only at runtime. The Mnemon Native ZIP contains only Runtime, Documents, and native Memory Spaces; external service data, credentials, and local third-party stores are excluded.
+External service settings, Memory Space scope settings, and secrets are stored in `state/memory-providers.json` under the selected scope root, not in the profile patch. Multiple Memory Spaces reuse one provider service configuration; the Host merges both layers only at runtime. The Mnemon Native ZIP contains only Runtime, Documents, and native Memory Spaces; external service data, credentials, and local third-party stores are excluded.
 
 ## CLI Discovery Precedence
 
@@ -259,9 +308,9 @@ After the Memory Space directory has been established, long-term semantic operat
 
 ## Background Task Agent Model Route
 
-AI metadata, Agent Query, workbench/conversation memory distillation, and document archiving create a clean independent top-level task Agent. It uses the selected workspace as its cwd, works even when no main Agent session is selected, and is disposed after the task finishes.
+Tidy names and descriptions, Ask Agent, Save to memory in the Memory System and in conversations, and document archiving create a clean independent top-level task Agent. It uses the selected workspace as its cwd, works even when no main Agent session is selected, and is disposed after the task finishes.
 
-The default `inherit` mode first uses the DSH Provider / Model selected for new sessions, then falls back to a complete route from the current available main Agent. Choosing **Choose model provider** in Settings stores a complete Provider + Model and overrides only Mnemon background tasks; it does not change the conversation Agent. When semantic judgment requires a bounded worker inside that task Agent, the worker inherits the task Agent route.
+The default `inherit` mode first uses the DSH Provider / Model selected for new sessions, then falls back to a complete route from the current available main Agent. Choosing **Choose a model** under **Background tasks → Task Agent model** on the Layered strategy's page stores a complete Provider + Model and overrides only Mnemon background tasks; it does not change the conversation Agent. When semantic judgment requires a bounded worker inside that task Agent, the worker inherits the task Agent route.
 
 ```yaml
 mnemon:
@@ -271,7 +320,7 @@ mnemon:
     model: deepseek-chat
 ```
 
-DSH 0.1.1-rc.2 includes each model's declared input modalities in the live catalog. dsh-mnemon preserves that metadata and labels image-capable choices as **Image input**; the 0.1.1 prerelease line's first-party image-capable entry is `deepseek-official/deepseek-v4-flash-vision-exp`. Selecting it does not make current Mnemon background jobs ingest images: AI metadata, Agent Query, distillation, smart selection, and Document archive still submit text and bounded evidence. In the main conversation, DSH-owned image blocks keep their durable attachment references when dsh-mnemon appends lifecycle guidance, while activity thresholds count text blocks only. Raw image bytes are not copied into Runtime, Documents, or Memory Spaces.
+DSH's live catalog reports each model's input modalities, and the picker labels image-capable models **Image input**. Choosing one does not make Mnemon background jobs ingest images: Tidy names and descriptions, Ask Agent, Save to memory, smart selection and document archiving still submit text and bounded evidence. In the main conversation, DSH-owned image blocks keep their attachment references when dsh-mnemon adds lifecycle guidance, while activity thresholds count text blocks only. Raw image bytes are never copied into runtime memory, documents or memory spaces.
 
 ## Provider Requirements
 
@@ -283,13 +332,22 @@ persona      = true
 depthLimit   = true
 ```
 
-Background review has no fallback: a compatible provider named `fork` must exist and must have:
+Background review defaults to a non-inheriting `spawn` provider and an explicit, bounded checkpoint from the parent's current public surface. It includes whole visible text messages and successful tool results; omitted or unavailable context is not reconstructed. `idleReview.provider: fork` retains full-parent-context review and requires `inheritsParentContext=true`. If fork is missing or incompatible, `idleReview.fallback` chooses `spawn` or `skip` before startup. A started run is never retried through another provider.
 
-```text
-inheritsParentContext = true
-```
+Review requires local child publication, `agents.isOwnedBy`, and `agent.ctx.tools.guard`; the guard also blocks unrelated own-scope plugin tools and Code Mode subcalls. `maxContextChars` bounds the spawn checkpoint, while `maxTokens` limits each model response, not the inherited fork input or total multi-step usage.
 
-A missing `fork` does not block deterministic state or regular UI reads, but a subagent failure is recorded when the review threshold is reached.
+**What review writes.** Each piece of knowledge goes to one layer. Project records, such as a design, implementation details, paths, ports, scope agreements or a handoff, go to at most one Document. Working memory (MEMORY.md) takes only a compact rule the user stated, such as a convention, a correction, an environment fact or a tool quirk, that no Document or existing entry already covers; USER.md takes identity and preferences. The guard holds each pass to one layer: after a Document, working-memory changes are refused, and after a working-memory change, a Document is refused; USER.md changes stay independent. `idleReview.runtimeMemory: false` withholds `mnemon_runtime_memory` from review, so it only creates Documents. Review never writes Memory Spaces: working memory reaches them through capacity archiving and Documents through cold archiving, while **Save to memory** and `mnemon_remember` write them directly.
+
+`idleReviewMs` remains the continuous-idle debounce. A separate `minIntervalMs` spaces attempts, including failures and cancellations. `maxPerSession` caps attempts for the loaded parent Agent; zero suspends review. Clearing or compacting the context (DSH replaces the Agent), restarting the Host, or unloading and reopening the Agent starts a new in-memory budget. Completed runs are disposed through DSH's public API. Persisted session history is retained: the published Host provides no plugin-scoped archive/TTL contract, and Mnemon never deletes session files or other plugins' agents.
+
+**Agent Teams compatibility:** `idleReview.agentTeams: pause` remains the default for existing profiles. It pauses before child creation when both the public `agentTeams` service and parent-scoped `spawn_teammate` tool are present. TeamService alone does not pause review.
+
+With DSH and all official Agent Teams components at **0.1.7-rc.2**, select **Scoped child review** under Idle review on the Layered strategy's page (**Plugins → dsh-mnemon**), or set `idleReview.agentTeams: scoped`. That published Team policy supports both bounded spawn and explicit fork. The opt-in retains parent ownership checks, local child publication, `maxDepth: 1`, and the monotonic review-tool allowlist, including Code Mode dispatch. Team tools and further delegation stay denied to the reviewer; the parent keeps Teams. No package-version guess or other plugin policy removal is used. Missing guard/ownership support or a policy error fails the run without fallback replay. Keep `pause` to leave review off while Team tools are installed, or use `idleReview.enabled: false` to disable only review while keeping Teams, recall and explicit writes.
+
+Bounded spawn reads live-user evidence from the public flat `user/message` event payload. It includes only whole visible messages before the completed checkpoint; injected recall, summaries and messages without a live-user source are not promoted to user assertions. This preserves explicit decisions and no-write instructions within the configured character budget.
+
+Failed reviews remain failures. The workspace shows the child run id and committed mutation receipt metadata when writes happened before failure, including a committed inner tool followed by a failed Code Mode wrapper. No rollback or automatic replay occurs. Inspect the run and the listed document ids or Runtime revisions before any manual retry. A later review still respects the cooldown and session budget. To disable only this maintenance pass, turn off **Idle review** on the Layered strategy's page, or set `idleReview.enabled: false`.
+
 
 ## Read-Only Configuration
 
@@ -332,33 +390,34 @@ routingGuidance=false
 
 ## Entry Placement: `displayMode` and `tabEnabled`
 
-Memory System defaults to Sidebar, opening a dedicated center-column workbench with a minimal, logo-free skin aligned with official DSH panels. Set `displayMode: builtin`, or select Builtin in Settings, to put that same workspace in the current conversation's `conversation.view` tab instead. Pages, navigation, dialogs, and styling remain shared; there is no separate builtin UI.
+Memory System defaults to Sidebar, opening a dedicated center-column workbench with a minimal, logo-free skin aligned with official DSH panels. Set `displayMode: builtin`, or choose **Conversation tab** under **Interface → Memory System opens in**, to put that same workspace in the current conversation's `conversation.view` tab instead. Pages, navigation, dialogs, and styling remain shared; there is no separate builtin UI. Theme authors can use the [supported surface selectors and custom properties](../guides/ui-guide.md#theme-skin-overrides) in either placement.
 
-The sidebar entry is an explicit navigation action: clicking it again keeps the workspace open; use “Back to conversation” to close it. Switching to the task board or SSH synchronizes both visibility and entry state, so a missed peer activation notification cannot prevent reopening Memory System.
+The sidebar entry follows DSH's native Plugins row for styling, collapsed icons and selection. Clicking it again keeps the workspace open; **Back to chat** or Escape returns to the current conversation. Selecting Plugins, another native panel or New Session switches the main panel. Switching to the task board or SSH synchronizes both visibility and entry state, so a missed peer activation notification cannot prevent reopening Memory System.
 
-Builtin omits the header's storage-mode badge, workspace picker, and alignment controls. Every read, write, and independent task request follows its owning session through the existing Host routing:
+The conversation tab omits the header's storage-mode badge, workspace picker and alignment controls. Every read, write, and independent task request follows its owning session through the existing Host routing:
 
-| `storageScope` | Builtin read/write root |
+| `storageScope` | Conversation-tab read/write root |
 |---|---|
 | `global` | Shared `MNEMON_DATA_DIR` or `~/.mnemon`, regardless of the session workspace |
 | `workspace` | The current session's `<cwd>/.mnemon`; switching conversations follows their respective workspaces |
 | `custom` | Configured `dataDir`, regardless of the session workspace |
+| `workspaces` | The current session’s subtree under `<central-root>/workspaces/<workspace-path-hash>/` |
 
-The existing `runtimeUserScope: global` exception still keeps USER.md global. Changing placement does not change scope, migrate memory data, or revive the old builtin navigation. Settings RPC applies entry changes live.
+The existing `runtimeUserScope: global` exception still keeps USER.md global. Changing placement does not change scope, migrate memory data, or revive the old builtin navigation. A placement change applies when selected.
 
-The canonical spelling is **`builtin`**. Historical `displayMode: buildin` preferences ignored by v0.4.0–v0.4.1 are accepted again, but runtime and UI state normalize them to `builtin`. On startup and external settings changes, the Host rewrites that one field through DSH's revision-fenced settings writer. Old-client RPC writes also persist `builtin` directly. Other fields and document comments are preserved; an explicit newer Sidebar choice wins a concurrent migration.
+The canonical spelling is **`builtin`**. Historical `displayMode: buildin` preferences are accepted, and runtime and UI state normalize them to `builtin`. On startup and external settings changes, the Host rewrites that one field through DSH's revision-fenced settings writer. Old-client RPC writes also persist `builtin` directly. Other fields and document comments are preserved; an explicit newer Sidebar choice wins a concurrent migration.
 
-Saving from the Settings page updates the current UI immediately. Direct edits to `settings.yaml` are detected and normalized by the Host, but the current Mnemon Client settings snapshot does not subscribe to external-file pushes; reload the browser to observe those changes. This is the same Client behavior as main, not a separate storage or plugin migration.
+Saving on the `dsh-mnemon` page under Plugins updates the current UI immediately. On loopback pages the Client also follows DSH's settings document: a save from another window, or a profile edit the Host reloads, shows up without a browser reload. Remote pages do not receive DSH's settings mirror; reload them to observe changes made elsewhere.
 
 If the old value comes only from a composition profile, migration saves a canonical user-setting override instead of rewriting the profile file. A read-only settings provider still recognizes the alias but is not written; a persistence failure is reported in the Host log without disabling the normalized entry.
 
-`tabEnabled=false` removes the selected entry and workbench live; enabling it again restores the configured placement. The two entries are mutually exclusive. Host RPC, commands, and tools remain registered, so an Agent or command already in progress stays valid. Turn memory and Save to memory remain independently controlled by `mnemon-ui` and navigate to the selected placement.
+`tabEnabled=false` removes the selected entry and workbench live; enabling it again restores the configured placement. The two entries are mutually exclusive. Host RPC, commands, and tools remain registered, so an Agent or command already in progress stays valid. The turn memory bar and Save to memory stay controlled by their own Interface switches and navigate to the selected placement.
 
 ## Profile Patch Overrides
 
 The bundled `cordis.patch.yml` provides the default config row. A DSH profile configuration with the same ID may replace that row as a whole. Do not add only `cliPath` to a final profile patch: use `MNEMON_CLI_PATH` or the `mnemon.cliPath` user setting instead. When a profile patch must be customized for another reason, retain every key that must remain enabled instead of assuming a deep merge.
 
-The `remoteAccess` override needed for a cloud rc.2 rollback is one such whole-row customization. Stable DSH 0.1.2-rc.1 does not need that override. When rc.2 is required, use the complete, upgrade-aware example in the [cloud-hosted WebUI procedure](../guides/operations.md#cloud-hosted-webui), not a standalone `config: { remoteAccess: trusted-host }` fragment.
+A `remoteAccess` override for authenticated Gateway management is one such whole-row customization. Use the complete, upgrade-aware example in the [remote management procedure](../guides/operations.md#remote-management), preserving the rest of the current configuration; a standalone `config: { remoteAccess: trusted-host }` fragment replaces those other fields.
 
 ## Common Configurations
 

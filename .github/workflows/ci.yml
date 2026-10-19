@@ -13,18 +13,55 @@ permissions:
   contents: read
 
 jobs:
+  verify-windows-workspace:
+    name: Verify Windows workspace paths (Node ${{ matrix.node }})
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24']
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: npm install --global pnpm@10.13.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test workspace identities and platform paths
+        run: pnpm exec vitest run tests/workspace-storage.spec.ts tests/client-platform-boundary.spec.ts tests/async-subagent-memory.spec.ts
+
+      - name: Test desktop CLI process ownership and hidden native launches
+        run: >-
+          pnpm exec vitest run tests/host-process.spec.ts tests/version-updates.spec.ts
+          plugins/dsh-mnemon-source-memory-spaces/tests/npm-native-cli.spec.ts
+          plugins/dsh-mnemon-source-memory-spaces/tests/runner.spec.ts
+          plugins/dsh-mnemon-source-memory-spaces/tests/process.spec.ts
+
   verify-source:
     name: Verify source (Node 22.19)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           fetch-depth: 2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22.19.0
           package-manager-cache: false
@@ -67,7 +104,7 @@ jobs:
         run: pnpm run verify:package
 
       - name: Set up Node.js 20 for runtime compatibility
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20
           package-manager-cache: false
@@ -81,10 +118,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           package-manager-cache: false

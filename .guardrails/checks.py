@@ -21,7 +21,11 @@ def quality():
     script = commands[package["name"]]
     if script not in package.get("scripts", {}):
         raise RuntimeError(f"Missing upstream quality command: {script}")
-    run("pnpm", "run", script)
+    # Git exports repository-local variables to hooks. Do not let tests that
+    # create isolated Git repositories accidentally operate on this worktree.
+    local_variables = subprocess.check_output(["git", "rev-parse", "--local-env-vars"], text=True).splitlines()
+    quality_env = {key: value for key, value in os.environ.items() if key not in local_variables}
+    subprocess.run(["pnpm", "run", script], check=True, env=quality_env)
 
 
 def scan_history(revision):

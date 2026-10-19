@@ -1,8 +1,7 @@
 import type { MnemonTranslate } from './locales.ts'
 import css from './MnemonWorkspace.module.css'
 import type { MnemonWorkspaceController } from './workspace-controller.ts'
-
-export const MNEMON_ENTRY_SELECTOR = '[data-dsh-mnemon-entry]'
+import { createMemoryIcon } from './memory-icon.tsx'
 
 const FAMILY_SELECTOR = '[data-dsh-taskboard-entry], [data-dsh-ssh-entry], [data-dsh-mnemon-entry]'
 
@@ -22,37 +21,16 @@ function newSessionButton(root: HTMLElement): HTMLButtonElement | undefined {
   return undefined
 }
 
-function createIcon(): SVGSVGElement {
-  const namespace = 'http://www.w3.org/2000/svg'
-  const icon = document.createElementNS(namespace, 'svg')
-  icon.setAttribute('viewBox', '0 0 16 16')
-  icon.setAttribute('width', '18')
-  icon.setAttribute('height', '18')
-  icon.setAttribute('fill', 'none')
-  icon.setAttribute('stroke', 'currentColor')
-  icon.setAttribute('stroke-width', '1.5')
-  icon.setAttribute('stroke-linecap', 'round')
-  icon.setAttribute('stroke-linejoin', 'round')
-  icon.setAttribute('aria-hidden', 'true')
-  const ellipse = document.createElementNS(namespace, 'ellipse')
-  ellipse.setAttribute('cx', '8')
-  ellipse.setAttribute('cy', '3.5')
-  ellipse.setAttribute('rx', '5')
-  ellipse.setAttribute('ry', '2')
-  const path = document.createElementNS(namespace, 'path')
-  path.setAttribute('d', 'M3 3.5v4c0 1.1 2.2 2 5 2s5-.9 5-2v-4M3 7.5v4c0 1.1 2.2 2 5 2s5-.9 5-2v-4')
-  icon.append(ellipse, path)
-  return icon
-}
-
 function createEntry(controller: MnemonWorkspaceController): { entry: HTMLButtonElement; label: HTMLSpanElement } {
   const entry = document.createElement('button')
   entry.type = 'button'
   entry.dataset.dshMnemonEntry = ''
+  entry.dataset.dshPlugin = 'dsh-mnemon'
+  entry.dataset.dshPart = 'sidebar-entry'
   entry.className = css.entry ?? ''
   const icon = document.createElement('span')
   icon.className = css.entryIcon ?? ''
-  icon.append(createIcon())
+  icon.append(createMemoryIcon(16))
   const label = document.createElement('span')
   label.className = css.entryLabel ?? ''
   entry.append(icon, label)
@@ -79,7 +57,7 @@ function placeEntry(root: HTMLElement, entry: HTMLButtonElement): boolean {
 export function mountMnemonSidebarEntry(
   controller: MnemonWorkspaceController,
   t: MnemonTranslate,
-  subscribeLocale?: (listener: () => void) => () => void,
+  subscribeLocale: (listener: () => void) => () => void,
 ): () => void {
   const { entry, label } = createEntry(controller)
   let root: HTMLElement | undefined
@@ -123,12 +101,18 @@ export function mountMnemonSidebarEntry(
   const waitObserver = new MutationObserver(tryPlace)
   waitObserver.observe(document.body, { childList: true, subtree: true })
 
+  // Like DSH's own panel row, the open workspace is also the current page.
   const syncActive = (): void => {
-    if (controller.getSnapshot().open) entry.dataset.active = 'true'
-    else delete entry.dataset.active
+    if (controller.getSnapshot().open) {
+      entry.dataset.active = 'true'
+      entry.setAttribute('aria-current', 'page')
+    } else {
+      delete entry.dataset.active
+      entry.removeAttribute('aria-current')
+    }
   }
   const unsubscribe = controller.subscribe(syncActive)
-  const unsubscribeLocale = subscribeLocale?.(syncLabel) ?? (() => {})
+  const unsubscribeLocale = subscribeLocale(syncLabel)
   const dispose = (): void => {
     waitObserver.disconnect()
     rootObserver.disconnect()

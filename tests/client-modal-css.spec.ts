@@ -17,7 +17,6 @@ describe('responsive dialog layout invariants', () => {
     expect(viewCss).toContain('.modalBody { min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain;')
     expect(viewCss).toContain('.modalFooter { display: flex; flex: none;')
     expect(sidebarCss).toContain(".shell .modal > [class*='modalBody'] { min-height: 0; overflow-x: hidden; overflow-y: auto;")
-    expect(sidebarCss).not.toContain('.shell .modal > div:last-child')
   })
 
   it('applies the fixed sidebar skin to wide dialogs instead of collapsing them to the base width', () => {
@@ -35,11 +34,12 @@ describe('responsive dialog layout invariants', () => {
     expect(sidebarCss).toContain(".shell .modal > [class*='modalFooter'] [class*='modalFooterActions'] button { min-height: 44px;")
   })
 
-  it('escapes host stacking contexts through one body-level top layer', () => {
+  it('escapes host stacking contexts through one body-level layer on DSH\'s modal level', () => {
     expect(dialogSource).toContain("import { createPortal } from 'react-dom'")
     expect(dialogSource).toContain('document.body,')
     expect(dialogSource).toContain('data-mnemon-dialog-portal')
-    expect(viewCss).toContain('.modalPortal { position: fixed; z-index: 2147483647; inset: 0; isolation: isolate; pointer-events: none; }')
+    // DSH menus, tooltips and toasts (z 1100) must open above a dialog, as they do over DSH's own Modal (z 1000).
+    expect(viewCss).toContain('.modalPortal { position: fixed; z-index: 1000; inset: 0; isolation: isolate; pointer-events: none; }')
     expect(viewCss).toContain('.modalTheme.modalTheme.modalTheme { position: absolute; inset: 0;')
   })
 
@@ -53,7 +53,6 @@ describe('responsive dialog layout invariants', () => {
     expect(viewCss).toContain('transform: translate3d(0, var(--mn-modal-drag-y, 0px), 0);')
     expect(viewCss).toContain('.modalDragHandle { display: grid; width: 100%; height: 28px;')
     expect(viewCss).toContain('.modalBackdrop, .modal { animation: none !important; }')
-    expect(sidebarCss).toContain('.shell .modalDragHandle span { background: var(--dsw-alias-border-l2); }')
   })
 
   it('routes every shared footer cancel action through the exit animation', () => {

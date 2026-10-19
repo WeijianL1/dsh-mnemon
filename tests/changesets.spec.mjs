@@ -6,8 +6,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
-import { assertVersionedReleaseIntent } from '../scripts/check-release-intent.mjs'
-import { createReleasePlan } from '../scripts/release.mjs'
+import { assertReleaseIntentCoverage, assertVersionedReleaseIntent, introducedPackageBaseVersions } from '../scripts/check-release-intent.mjs'
+import { createReleasePlan, publicationInputsChanged } from '../scripts/release.mjs'
 
 const execute = promisify(execFile)
 const require = createRequire(import.meta.url)
@@ -107,5 +107,44 @@ describe('independent package versioning', () => {
     ]) })
     expect(() => assertVersionedReleaseIntent(incompletePlan, paths, { ignoredPackageJson: new Set() }, []))
       .toThrow(/without a version bump: dsh-mnemon-source-example/u)
+  })
+
+  it('asks an introduced package for a release intent without turning the change into a release', () => {
+    const introduced = 'dsh-mnemon-strategy-example'
+    const packages = [
+      {
+        directory: `/fixture/plugins/${introduced}`,
+        manifest: published(introduced, '0.5.0', { peerDependencies: { 'dsh-mnemon': '^0.5.1' } }),
+      },
+      {
+        directory: '/fixture',
+        manifest: published('dsh-mnemon', '0.5.1', { dependencies: { [introduced]: '0.5.0' } }),
+      },
+    ]
+    const baseVersions = new Map([['dsh-mnemon', '0.5.1']])
+    expect(() => createReleasePlan(packages, { baseVersions })).toThrow(/Starter version must advance/u)
+
+    const plan = createReleasePlan(packages, { baseVersions: introducedPackageBaseVersions(packages, baseVersions) })
+    expect(plan.releasePackages).toEqual([])
+    const changed = publicationInputsChanged(plan, ['package.json', `plugins/${introduced}/package.json`, `plugins/${introduced}/src/index.ts`])
+    expect([...changed].sort()).toEqual(['dsh-mnemon', introduced])
+    expect(() => assertReleaseIntentCoverage(changed, [{ name: 'dsh-mnemon', type: 'patch' }])).toThrow(introduced)
+    expect(() => assertReleaseIntentCoverage(changed, [{ name: 'dsh-mnemon', type: 'patch' }, { name: introduced, type: 'patch' }])).not.toThrow()
+  })
+
+  it('includes initial publications when existing packages advance without exempting unchanged packages', () => {
+    const introduced = 'dsh-mnemon-strategy-example'
+    const unchanged = 'dsh-mnemon-source-example'
+    const packages = [
+      { directory: `/fixture/plugins/${introduced}`, manifest: published(introduced, '0.5.0', { peerDependencies: { 'dsh-mnemon': '^0.5.1' } }) },
+      { directory: `/fixture/plugins/${unchanged}`, manifest: published(unchanged, '0.5.1', { peerDependencies: { 'dsh-mnemon': '^0.5.1' } }) },
+      { directory: '/fixture', manifest: published('dsh-mnemon', '0.5.2', { dependencies: { [introduced]: '0.5.0', [unchanged]: '0.5.1' } }) },
+    ]
+    const baseVersions = new Map([['dsh-mnemon', '0.5.1'], [unchanged, '0.5.1']])
+    const plan = createReleasePlan(packages, { baseVersions: introducedPackageBaseVersions(packages, baseVersions) })
+    const paths = ['package.json', `plugins/${introduced}/src/index.ts`]
+    expect([...assertVersionedReleaseIntent(plan, paths, {}, [])].sort()).toEqual(['dsh-mnemon', introduced])
+    expect(() => assertVersionedReleaseIntent(plan, [...paths, `plugins/${unchanged}/src/index.ts`], {}, [])).toThrow(unchanged)
+    expect(() => assertVersionedReleaseIntent(plan, paths, {}, ['unconsumed.md'])).toThrow('pending changesets')
   })
 })

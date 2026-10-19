@@ -31,8 +31,9 @@ jobs:
       notes: ${{ steps.release.outputs.notes }}
     steps:
       - name: Check out frozen revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           ref: ${{ inputs.revision }}
           fetch-depth: 0
 
@@ -45,7 +46,7 @@ jobs:
           test -z "$(git status --porcelain)"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -73,15 +74,19 @@ jobs:
           notes=".github/release-notes/${tag}.md"
           test -f "$notes"
           artifact="npm-release-${version}-${RELEASE_REVISION:0:12}"
-          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
-          echo "RELEASE_PRERELEASE=$prerelease" >> "$GITHUB_ENV"
-          echo "RELEASE_BASE_REVISION=$base_revision" >> "$GITHUB_ENV"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "base=$base_revision" >> "$GITHUB_OUTPUT"
-          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+          {
+            echo "RELEASE_TAG=$tag"
+            echo "RELEASE_PRERELEASE=$prerelease"
+            echo "RELEASE_BASE_REVISION=$base_revision"
+          } >> "$GITHUB_ENV"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "base=$base_revision"
+            echo "artifact=$artifact"
+            echo "prerelease=$prerelease"
+            echo "notes=$notes"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -92,7 +97,7 @@ jobs:
       - name: Run complete workspace verification
         run: pnpm run verify
 
-      - name: Verify independent plugins and packed v0.4.7 upgrade E2E
+      - name: Verify independent plugins and packed v0.5.15 upgrade E2E
         env:
           MNEMON_PLUGIN_VERIFY_CONCURRENCY: '4'
         run: pnpm run verify:plugins --skip-build
@@ -101,7 +106,7 @@ jobs:
         run: node scripts/release.mjs --pack --artifacts release-artifacts
 
       - name: Upload frozen release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.release.outputs.artifact }}
           path: release-artifacts/
@@ -127,13 +132,14 @@ jobs:
       NPM_CONFIG_REGISTRY: https://registry.npmjs.org
     steps:
       - name: Check out frozen revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           ref: ${{ inputs.revision }}
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -145,7 +151,7 @@ jobs:
           pnpm install --frozen-lockfile
 
       - name: Download frozen release artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: ${{ needs.prepare.outputs.artifact }}
           path: release-artifacts
@@ -172,10 +178,10 @@ jobs:
       - name: Read back and install the complete Registry release
         run: node scripts/release.mjs --verify-release --artifacts release-artifacts
 
-      - name: Smoke-test a real v0.4.7 Registry upgrade
+      - name: Smoke-test a real v0.5.16 Registry upgrade
         run: >-
           node scripts/verify-headless-profile.mjs
-          --upgrade-from dsh-mnemon@0.4.7
+          --upgrade-from dsh-mnemon@0.5.16
           --upgrade-registry https://registry.npmjs.org
           --package dsh-mnemon@${{ needs.prepare.outputs.version }}
           --registry https://registry.npmjs.org
@@ -196,8 +202,9 @@ jobs:
       RELEASE_NOTES_FILE: ${{ needs.prepare.outputs.notes }}
     steps:
       - name: Check out frozen revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           ref: ${{ inputs.revision }}
           fetch-depth: 0
 

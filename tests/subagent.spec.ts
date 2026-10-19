@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { HostAgent, HostContextShape, HostSubagentsService, ToolDefinition } from "../src/host/dsh.ts"
+import type { HostAgent, HostContextShape, HostSubagentsService, ToolDefinition, ToolExecution } from "../src/host/dsh.ts"
 import type { RememberRequest, MemoryBodyCatalog as MemorySpaceCatalog, SearchRequest, Insight, MemoryPlacementCandidate, PreparedMemoryPlacement } from 'dsh-mnemon-source-memory-spaces/contracts'
 import type { DocumentMutationResult, DocumentView, DocumentMutation } from 'dsh-mnemon-source-documents/contracts'
 import type { RuntimeMemoryMaintenancePlan, RuntimeMemoryMutation, RuntimeMemoryMutationResult, RuntimeMemorySnapshot } from 'dsh-mnemon-source-runtime/contracts'
@@ -13,14 +13,16 @@ import type { MnemonAgentRuntimeSource, MnemonRuntimeGraph } from '../src/host/r
 import { agentScope } from '../src/host/runtime.ts'
 import { AgentMemoryTurn } from '../src/host/agent-memory-turn.ts'
 import { MemoryExecutions } from '../src/host/memory-executions.ts'
-import type { SourceSession } from '../src/host/source-session.ts'
+import { SourceSession } from '../src/host/source-session.ts'
 import type { ComposableMemoryTurn } from '../src/core/turns.ts'
 import { sourceFixture } from './fixtures/sources.ts'
 import { compositionFixture } from './fixtures/composition.ts'
 import { assertDshOutputSchema, MnemonSubagentCoordinator } from "../src/host/subagent.ts"
+import { CONTINUATION_TEXT } from '../src/host/continuation-turn.ts'
 import { DEFAULT_THREE_TIER_VIEW_STRATEGY } from 'dsh-mnemon-strategy-default-three-tier'
 import { registerTools } from "../src/host/tools.ts"
 import { resolveConfig } from "../src/host/config.ts"
+import { sessionLog } from './fixtures/session-log.ts'
 
 const capabilities = { outputSchema: true, depthLimit: true, toolFilter: true, persona: true }
 const temporaryDirectories: string[] = []
@@ -35,7 +37,7 @@ function parent(origin?: 'subagent'): HostAgent {
   return {
     id: origin === undefined ? 'root' : 'child',
     status: 'idle',
-    session: { header: { ...(origin === undefined ? {} : { origin }) }, events: [] },
+    session: { header: { ...(origin === undefined ? {} : { origin }) }, ...sessionLog() },
   } as unknown as HostAgent
 }
 
@@ -53,7 +55,7 @@ function service(): SpaceData {
     provider: {
       id: 'mnemon-native',
       label: 'Mnemon Native',
-      capabilities: { search: true, remember: true },
+      capabilities: { search: true, remember: true, forget: true, writeMode: 'exact' },
     },
   }
   const catalog = {
@@ -119,7 +121,7 @@ function addSecondWritableBody(memoryService: SpaceData): void {
 
 function subagents(structured: unknown, stopReason = 'completed', providers = ['spawn'], localAgent?: HostAgent, diagnostic?: string) {
   const dispose = vi.fn(async () => {})
-  const start = vi.fn(async () => ({
+  const start = vi.fn(async (_provider?: string, _request?: Parameters<HostSubagentsService['start']>[1]) => ({
     id: 'child-run-1',
     result: Promise.resolve({ output: [], structured, stopReason, ...(diagnostic === undefined ? {} : { diagnostic }) }),
     dispose,
@@ -131,6 +133,18 @@ function subagents(structured: unknown, stopReason = 'completed', providers = ['
     start,
   } as unknown as HostSubagentsService
   return { value, start, dispose }
+}
+
+function resultArguments(request: { persona?: string }, result: unknown) {
+  const requestId = request.persona?.match(/requestId `([^`]+)`/u)?.[1]
+  if (requestId === undefined) throw new Error('Missing delegated result capability')
+  return { requestId, result }
+}
+
+function delegatedResultSchema(request: { persona?: string }): { properties: Record<string, { enum?: unknown[] }> } {
+  const schema = request.persona?.split('matching this JSON schema:\n')[1]?.split('\n')[0]
+  if (schema === undefined) throw new Error('Missing delegated result schema')
+  return JSON.parse(schema)
 }
 
 function toolRegistry() {
@@ -154,7 +168,20 @@ function toolRegistry() {
   const emit = (name: string, ...args: unknown[]) => {
     for (const listener of listeners.get(name) ?? []) listener(...args)
   }
-  return { value: { tools: { register }, on }, register, on, emit, definitions, disposers }
+  const owners = new Map<string, HostAgent>()
+  const agents = { isOwnedBy: (id: string, owner: HostAgent) => owners.get(id) === owner }
+  const publish = (child: HostAgent, owner: HostAgent) => { owners.set(child.id, owner); emit('agent/created', { agent: child }) }
+  const withReviewPublication = (host: HostSubagentsService): HostSubagentsService => ({ ...host,
+    async start(provider, request) {
+      const run = await host.start(provider, request)
+      if (request.label !== 'Mnemon idle checkpoint review') return run
+      const child = { ...parent('subagent'), id: run.id, ctx: { tools: { guard: () => () => {} } } } as unknown as HostAgent
+      owners.set(child.id, request.parent)
+      emit('agent/created', { agent: child })
+      return { ...run, localAgent: child }
+    },
+  })
+  return { value: { tools: { register }, on, agents }, register, on, emit, publish, definitions, disposers, withReviewPublication }
 }
 
 interface SpaceData {
@@ -168,7 +195,7 @@ interface SpaceData {
   remember(request: RememberRequest, signal?: AbortSignal): Promise<unknown>
   rememberMany(requests: readonly RememberRequest[], signal?: AbortSignal): Promise<unknown[]>
   link(): Promise<unknown>
-  forget(): Promise<unknown>
+  forget(id?: string, signal?: AbortSignal, memoryBodyId?: string): Promise<unknown>
   createBody(): Promise<unknown>
   updateBody(): unknown
   mergeBodies(): Promise<unknown>
@@ -188,8 +215,10 @@ function pinnedTurn(turnId: string, viewId: string, memoryBodyIds: string[] = ['
 }
 function managedSession(client: MemoryTestManagementClient) {
   return {
+    forGeneration() { return this },
     read: vi.fn(async <T,>(operation: string, input: unknown = null): Promise<T> => (await client.read(operation, input as MemoryJsonValue)).value as T),
     mutate: vi.fn(async <T,>(operation: string, input: unknown): Promise<T> => (await client.mutate(operation, input as MemoryJsonValue, { confirmed: true })).value as T),
+    mutateResult: vi.fn(async (operation: string, input: unknown) => client.mutate(operation, input as MemoryJsonValue, { confirmed: true })),
   } as unknown as SourceSession
 }
 
@@ -216,6 +245,9 @@ function runtimeSource(
     return policy
   }
   const spaceSession = {
+    forGeneration() { return this },
+    forInstance() { return this },
+    identity: async () => ({ sourceInstanceKey: 'source:mnemon-source-memory-spaces' }),
     forTurn: (turn: ComposableMemoryTurn) => ({ ...spaceSession, route: (operation: string, input: MemoryJsonValue, signal: AbortSignal) => {
       const route = { id: 'space/' + operation, sourceInstanceKey: 'source:mnemon-source-memory-spaces', sourceRouteId: operation, readGrantId: 'space-grant', maxCalls: 4 }
       return policyFor(turn).query({ route: route as never, input, signal }, async input => {
@@ -234,6 +266,7 @@ function runtimeSource(
       throw new Error('Unexpected Source read: ' + operation)
     },
     async mutate(operation: string, input: Record<string, unknown>, signal?: AbortSignal) {
+      if (operation === 'forget') return spaces.forget(String(input.id), signal, String(input.memoryBodyId))
       if (operation === 'remember-many') return spaces.rememberMany(input.requests as RememberRequest[], signal)
       if (operation === 'remember') return spaces.remember(input as unknown as RememberRequest, signal)
       throw new Error('Unexpected Source mutation: ' + operation)
@@ -247,6 +280,7 @@ function runtimeSource(
   }
   const operations = runtime as RuntimeOperations | undefined
   const runtimeSession = runtime && 'read' in runtime ? runtime : {
+    forGeneration() { return this },
     read: (operation: string, input: RuntimeMemoryMutation) => {
       if (operation === 'maintenance-plan') return operations!.planMaintenance(input)
       throw new Error('Unexpected Runtime read: ' + operation)
@@ -255,16 +289,22 @@ function runtimeSource(
       operation === 'mutate' ? operations!.mutate(input) : operations!.compactAndMutate(input.revision, input.mutation, input.compacted, input.maxBytes, input.lineage),
     action: async (_operation: string, input: RuntimeMemoryMutation) => ({ details: await operations!.mutate(input) }),
   }
+  if (!('mutateResult' in runtimeSession)) Object.assign(runtimeSession, {
+    mutateResult: async (...args: Parameters<SourceSession['mutate']>) => ({ revision: 'committed-revision', value: await (runtimeSession as unknown as SourceSession).mutate(...args) }),
+  })
   const documentSession = documents ?? { forTurn: (turn: ComposableMemoryTurn) => ({ route: (operation: string, input: MemoryJsonValue, signal: AbortSignal) => {
     if (!turn.view.readGrants.some(grant => grant.id === 'doc-grant')) turn.view.readGrants.push({ id: 'doc-grant', sourceInstanceKey: 'docs', schema: 'dsh-mnemon.documents/v1' } as never)
     return policyFor(turn).query({ route: { id: 'docs/search', sourceInstanceKey: 'docs', sourceRouteId: operation, readGrantId: 'doc-grant' } as never, input, signal }, async () => ({ id: 'docs', viewId: turn.view.id, routeId: 'docs/search', sourceInstanceKey: 'docs', observedAt: 'now', items: [], truncated: false }))
   } }) }
-  const graph = { config, composableTurns: turns, source: (type: string) => type === 'runtime' ? runtimeSession : type === 'documents' ? documentSession : spaceSession } as unknown as MnemonRuntimeGraph
+  // The serving generation composes with the configured Strategy.
+  const generation = { strategy: { definition: { manifest: { typeId: config.memoryTopology.strategyId } } } }
+  const graph = { config, memoryComposition: { acquire: () => ({ generation, release: () => {} }) }, composableTurns: turns, source: (type: string) => type === 'runtime' ? runtimeSession : type === 'documents' ? documentSession : spaceSession } as unknown as MnemonRuntimeGraph
   const source = { config, forAgent: vi.fn((_agent: HostAgent) => graph), bindAgentRuntime: vi.fn(() => () => {}) }
   return { ...source, executions: new MemoryExecutions(source) }
 }
 function createCoordinator(host: HostSubagentsService, runtime?: RuntimeOperations | MnemonAgentRuntimeSource | SourceSession) {
-  return new MnemonSubagentCoordinator(host, runtimeSource(runtime), toolRegistry().value)
+  const registry = toolRegistry()
+  return new MnemonSubagentCoordinator(registry.withReviewPublication(host), runtimeSource(runtime), registry.value)
 }
 
 function maintenancePlan(
@@ -290,6 +330,19 @@ function maintenancePlan(
     limit: target === 'memory' ? 10_240 : 4_096,
     requiresMaintenance: true,
   }
+}
+
+function runtimeArchiveFixture() {
+  const plan = maintenancePlan()
+  const runtime = {
+    mutate: vi.fn().mockRejectedValue(capacityError('memory', plan.used, plan.projected, plan.limit)),
+    planMaintenance: vi.fn(async () => plan),
+    compactAndMutate: vi.fn(async () => ({ success: true, target: 'memory', added: plan.pending!.content, usage: { used: 30, limit: plan.limit } })),
+  } as unknown as RuntimeOperations
+  const spaces = service()
+  const host = subagents({ action: 'planned', summary: 'Route both sources.', routes: [{ sourceIndexes: [1, 2], memoryBodyId: 'project' }] })
+  const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(runtime, spaces), toolRegistry().value)
+  return { plan, runtime, spaces, host, archive: (signal = new AbortController().signal) => coordinator.runtime(parent(), { action: 'add', target: 'memory', content: plan.pending!.content }, signal) }
 }
 
 function observedSubagents(
@@ -333,7 +386,226 @@ function emitSuccessfulToolResult(
   return execution
 }
 
+async function documentArchiveFixture(proposal: unknown = { action: 'planned', summary: 'Preserve the release gates.', memoryBodyId: 'project' }) {
+  const workspace = mkdtempSync(join(tmpdir(), 'dsh-mnemon-document-archive-'))
+  temporaryDirectories.push(workspace)
+  const documents = await sourceFixture({ dataDir: join(workspace, '.mnemon'), workspace })
+  releases.push(documents.dispose)
+  const controller = managedSession(documents.documents)
+  const created = await controller.mutate<DocumentMutationResult>('mutate', { action: 'create', title: 'Release design', content: 'Canary before production. Keep the exact original.' })
+  const spaces = service()
+  vi.mocked(spaces.search).mockResolvedValue({ query: '', mode: 'keyword', results: [] })
+  const host = subagents(proposal)
+  const agent = { ...parent(), session: { header: { cwd: workspace }, ...sessionLog() } } as HostAgent
+  const runtime = runtimeSource(undefined, spaces, controller)
+  const coordinator = new MnemonSubagentCoordinator(host.value, runtime, toolRegistry().value)
+  return { controller, document: created.document, spaces, host, agent, runtime, coordinator,
+    archive: (signal = new AbortController().signal) => coordinator.archiveDocument(agent, created.document.id, signal) }
+}
+
 describe('Mnemon memory subagent coordinator', () => {
+  it('archives a document with Host lineage without model-counted recall receipts (issue 222)', async () => {
+    const f = await documentArchiveFixture()
+    const result = await f.archive()
+    const request = vi.mocked(f.spaces.rememberMany).mock.calls[0]![0][0]!
+    expect(request.content).toContain(`.mnemon/documents/archived/${f.document.filename}`)
+    expect(request.content).toContain(f.document.contentHash)
+    expect(result).toMatchObject({ action: 'archived', document: { status: 'archived', content: f.document.content }, maintenance: { memoryBodyIds: ['project'] } })
+    expect(result.lineage).toEqual([{
+      source: { layerId: 'documents', reference: `document:${f.document.id}:1`, digest: f.document.contentHash },
+      destination: { layerId: 'memory-spaces', reference: expect.stringContaining('memory-space:project/item:'), digest: createHash('sha256').update(request.content).digest('hex') },
+    }])
+    expect(f.host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({ toolFilter: { allow: ['mnemon_subagent_result'] } }))
+    expect(f.spaces.rememberMany).toHaveBeenCalledOnce()
+    expect(f.spaces.remember).not.toHaveBeenCalled()
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { action: 'planned', summary: 'Invalid destination.', memoryBodyId: 'invented' },
+    { action: 'planned', summary: ' ', memoryBodyId: 'project' },
+    { action: 'planned', summary: 'x'.repeat(1001), memoryBodyId: 'project' },
+    { action: 'failed', summary: 'No safe index.', memoryBodyId: 'project' },
+  ])('rejects an invalid document archive proposal before any write: %j', async proposal => {
+    const f = await documentArchiveFixture(proposal)
+    await expect(f.archive()).rejects.toThrow()
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+    expect(f.spaces.remember).not.toHaveBeenCalled()
+    expect(f.spaces.createBody).not.toHaveBeenCalled()
+    expect((await f.controller.read<DocumentView>('document', { id: f.document.id })).status).toBe('active')
+  })
+
+  it('compensates only the newly created cold index when the document commit fails', async () => {
+    const f = await documentArchiveFixture()
+    vi.spyOn(f.controller, 'mutate').mockRejectedValueOnce(new Error('document revision conflict'))
+    await expect(f.archive()).rejects.toThrow('document revision conflict')
+    const content = vi.mocked(f.spaces.rememberMany).mock.calls[0]![0][0]!.content
+    expect(f.spaces.forget).toHaveBeenCalledWith(`stored-${createHash('sha256').update(content).digest('hex').slice(0, 8)}`, expect.any(AbortSignal), 'project')
+    expect((await f.controller.read<DocumentView>('document', { id: f.document.id })).status).toBe('active')
+  })
+
+  it('reuses an existing exact cold index after a failed attempt without deleting it on conflict', async () => {
+    const f = await documentArchiveFixture()
+    const content = `Prior archive index. .mnemon/documents/archived/${f.document.filename} ${f.document.contentHash}`
+    vi.mocked(f.spaces.search).mockResolvedValue({ query: '', mode: 'keyword', results: [{ id: 'pre-existing', content, memoryBodyId: 'project' } as Insight] })
+    vi.spyOn(f.controller, 'mutate').mockRejectedValueOnce(new Error('document revision conflict'))
+    await expect(f.archive()).rejects.toThrow('document revision conflict')
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+    await expect(f.archive()).resolves.toMatchObject({ action: 'archived' })
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+  })
+
+  it('cleans a new index with a fresh signal after caller cancellation', async () => {
+    const f = await documentArchiveFixture()
+    const abort = new AbortController()
+    vi.mocked(f.spaces.rememberMany).mockImplementationOnce(async requests => {
+      abort.abort(new Error('caller canceled'))
+      return [{ action: 'added', id: 'canceled-index', memoryBodyId: requests[0]!.memoryBodyId }]
+    })
+    await expect(f.archive(abort.signal)).rejects.toThrow('caller canceled')
+    expect(f.spaces.forget).toHaveBeenCalledWith('canceled-index', expect.any(AbortSignal), 'project')
+    expect(vi.mocked(f.spaces.forget).mock.calls[0]![1]!.aborted).toBe(false)
+  })
+
+  it('reports a failed cleanup with the exact destination for recovery', async () => {
+    const f = await documentArchiveFixture()
+    vi.mocked(f.spaces.rememberMany).mockResolvedValueOnce([{ action: 'added', id: 'orphan-index', memoryBodyId: 'project' }])
+    vi.spyOn(f.controller, 'mutate').mockRejectedValueOnce(new Error('disk unavailable'))
+    vi.mocked(f.spaces.forget).mockRejectedValueOnce(new Error('provider unavailable'))
+    await expect(f.archive()).rejects.toThrow(/cleanup failed.*project.*orphan-index/)
+  })
+
+  it('preserves the cold index if the document committed before a transport failure', async () => {
+    const f = await documentArchiveFixture()
+    const mutate = f.controller.mutate.bind(f.controller)
+    vi.spyOn(f.controller, 'mutate').mockImplementationOnce(async (...args) => {
+      await mutate(...args)
+      throw new Error('response interrupted after commit')
+    })
+    await expect(f.archive()).rejects.toThrow('index cleanup failed')
+    expect((await f.controller.read<DocumentView>('document', { id: f.document.id })).status).toBe('archived')
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+  })
+
+  it('rechecks the document revision after planning and before writing the index', async () => {
+    const f = await documentArchiveFixture()
+    const start = f.host.start.getMockImplementation()!
+    f.host.start.mockImplementationOnce(async () => {
+      await f.controller.mutate('mutate', { action: 'update', id: f.document.id, content: 'New revision.' })
+      return start()
+    })
+    await expect(f.archive()).rejects.toThrow('revision conflict before archive indexing')
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+  })
+
+  it('rechecks destination eligibility after planning and before index writes', async () => {
+    const f = await documentArchiveFixture()
+    const start = f.host.start.getMockImplementation()!
+    f.host.start.mockImplementationOnce(async () => {
+      f.spaces.bodyDirectory().items[0]!.active = false
+      return start()
+    })
+    await expect(f.archive()).rejects.toThrow('no longer eligible')
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+  })
+
+  it.each(['before planning', 'during planning'])('honors the live global read-only policy %s', async moment => {
+    const f = await documentArchiveFixture()
+    const disable = () => Object.defineProperty(f.runtime, 'config', { value: { ...f.runtime.config, writeEnabled: false } })
+    if (moment === 'before planning') disable()
+    else {
+      const start = f.host.start.getMockImplementation()!
+      f.host.start.mockImplementationOnce(async () => { disable(); return start() })
+    }
+    await expect(f.archive()).rejects.toThrow('read-only')
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+    expect((await f.controller.read<DocumentView>('document', { id: f.document.id })).status).toBe('active')
+    if (moment === 'before planning') expect(f.host.start).not.toHaveBeenCalled()
+  })
+
+  it('accepts a deduplicated index only with exact Host readback and never rolls it back', async () => {
+    const f = await documentArchiveFixture()
+    vi.mocked(f.spaces.rememberMany).mockImplementationOnce(async requests => {
+      vi.mocked(f.spaces.search).mockResolvedValue({ query: '', mode: 'keyword', results: [{ id: 'existing-index', content: requests[0]!.content, memoryBodyId: 'project' } as Insight] })
+      return [{ action: 'skipped', id: 'existing-index', memoryBodyId: 'project' }]
+    })
+    await expect(f.archive()).resolves.toMatchObject({ action: 'archived', lineage: [{ destination: { reference: 'memory-space:project/item:existing-index' } }] })
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+  })
+
+  it('archives and compensates through real composed Documents and Holographic Sources', async () => {
+    const f = await compositionFixture()
+    releases.push(f.dispose)
+    const body = await f.memorySpace()
+    const spaces = f.graph.source('memory-spaces')
+    await spaces.mutate('body-update', { memoryBodyId: body.id, request: { active: true } })
+    const documents = f.graph.source('documents')
+    const created = await documents.mutate<DocumentMutationResult>('mutate', { action: 'create', title: 'Composed archive', content: 'Keep the original code.' })
+    const host = subagents({ action: 'planned', summary: 'Cold index for the original code.', memoryBodyId: body.id })
+    const coordinator = new MnemonSubagentCoordinator(host.value, f.live, toolRegistry().value)
+    const agent = { ...parent(), session: { header: { cwd: f.workspace }, ...sessionLog() } } as HostAgent
+    await expect(coordinator.archiveDocument(agent, created.document.id, new AbortController().signal)).resolves.toMatchObject({ action: 'archived', lineage: [{ source: { digest: created.document.contentHash } }] })
+    const indexed = await spaces.read<{ results: Insight[] }>('search', { query: created.document.contentHash, memoryBodyIds: [body.id] })
+    expect(indexed.results).toHaveLength(1)
+    expect(indexed.results[0]!.content).toContain(created.document.contentHash)
+    const rejected = await documents.mutate<DocumentMutationResult>('mutate', { action: 'create', title: 'Conflict archive', content: 'A separate original that must stay active.' })
+    const original = SourceSession.prototype.mutate
+    const failCommit = vi.spyOn(SourceSession.prototype, 'mutate').mockImplementation(function (this: SourceSession, operation, input, signal) {
+      if (this.typeId === 'documents' && operation === 'archive') return Promise.reject(new Error('injected document commit failure'))
+      return original.call(this, operation, input, signal)
+    })
+    try {
+      await expect(coordinator.archiveDocument(agent, rejected.document.id, new AbortController().signal)).rejects.toThrow('injected document commit failure')
+    } finally { failCommit.mockRestore() }
+    const after = await spaces.read<{ results: Insight[] }>('search', { query: rejected.document.contentHash, memoryBodyIds: [body.id] })
+    expect(after.results.filter(item => item.content.includes(rejected.document.contentHash))).toEqual([])
+    expect((await documents.read<DocumentView>('document', { id: rejected.document.id })).status).toBe('active')
+    const originalIndex = await spaces.read<{ results: Insight[] }>('search', { query: created.document.contentHash, memoryBodyIds: [body.id] })
+    expect(originalIndex.results.some(item => item.id === indexed.results[0]!.id)).toBe(true)
+  })
+
+  it('rejects a destination activated outside the current View namespace grant', async () => {
+    const f = await compositionFixture()
+    releases.push(f.dispose)
+    const body = await f.memorySpace()
+    const spaces = f.graph.source('memory-spaces')
+    await spaces.mutate('body-update', { memoryBodyId: body.id, request: { active: true } })
+    const documents = f.graph.source('documents')
+    const created = await documents.mutate<DocumentMutationResult>('mutate', { action: 'create', title: 'Scoped document', content: 'Must not escape the active View.' })
+    const agent = { ...parent(), session: { header: { cwd: f.workspace }, ...sessionLog() } } as HostAgent
+    const turn = await f.graph.composableTurns.beginTurn('archive-scoped', agentScope(agent, f.config), 'test')
+    const outside = await spaces.mutate<{ id: string }>('body-create', { name: 'Outside pinned scope', description: 'Not in the immutable namespace grant.', providerId: 'holographic' })
+    await spaces.mutate('body-update', { memoryBodyId: outside.id, request: { active: true } })
+    const host = subagents({ action: 'planned', summary: 'No bypass.', memoryBodyId: outside.id })
+    const coordinator = new MnemonSubagentCoordinator(host.value, f.live, toolRegistry().value)
+    try {
+      await expect(coordinator.archiveDocument(agent, created.document.id, new AbortController().signal)).rejects.toThrow('ineligible Memory Space')
+      expect((await documents.read<DocumentView>('document', { id: created.document.id })).status).toBe('active')
+    } finally { await f.graph.composableTurns.endTurn(turn.turnId) }
+  })
+
+  it.each(['accepted', 'updated', 'skipped'])('never deletes an ambiguous or existing document index receipt: %s', async action => {
+    const f = await documentArchiveFixture()
+    vi.mocked(f.spaces.rememberMany).mockResolvedValueOnce([{ action, id: 'not-proven-new', memoryBodyId: 'project' }])
+    await expect(f.archive()).rejects.toThrow()
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+    expect((await f.controller.read<DocumentView>('document', { id: f.document.id })).status).toBe('active')
+  })
+
+  it.each(['inactive', 'disabled', 'async', 'no-forget'])('rejects an unsafe archive destination before model work: %s', async state => {
+    const f = await documentArchiveFixture()
+    const body = f.spaces.bodyDirectory().items[0]!
+    if (state === 'inactive') body.active = false
+    if (state === 'disabled') body.providerEnabled = false
+    if (state === 'async') body.provider.capabilities.writeMode = 'async-extracting'
+    if (state === 'no-forget') body.provider.capabilities.forget = false
+    await expect(f.archive()).rejects.toThrow(/archive.*Memory Space/)
+    expect(f.host.start).not.toHaveBeenCalled()
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+  })
+
   it('keeps a shared maintenance View until all concurrent children finish', async () => {
     const f = await compositionFixture()
     releases.push(f.dispose)
@@ -364,7 +636,7 @@ describe('Mnemon memory subagent coordinator', () => {
   })
 
 
-  it('waits for background child and result-tool cleanup before pinning a foreground turn', async () => {
+  it('waits for background child and result-observer cleanup before pinning a foreground turn', async () => {
     const f = await compositionFixture()
     releases.push(f.dispose)
     const root = parent()
@@ -374,7 +646,7 @@ describe('Mnemon memory subagent coordinator', () => {
     const host = subagents({ summary: 'No write needed.', action: 'skipped', memoryBodyIds: [] })
     host.dispose.mockImplementation(() => childCleanup.promise)
     const tools = toolRegistry()
-    tools.register.mockImplementationOnce(() => vi.fn(() => toolCleanup.promise))
+    tools.on.mockImplementationOnce(() => vi.fn(() => toolCleanup.promise))
     const coordinator = new MnemonSubagentCoordinator(host.value, f.live, tools.value)
     const background = coordinator.remember(root, { content: 'first' }, new AbortController().signal)
     await vi.waitFor(() => expect(host.dispose).toHaveBeenCalledOnce())
@@ -858,26 +1130,218 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(host.start).not.toHaveBeenCalled()
   })
 
-  it('captures a schema-validated result through the one-run tool without DSH structured output', async () => {
+  it('keeps one result-tool name and schema registered across consecutive delegated writes', async () => {
+    const resultTools = toolRegistry()
+    const host = subagents({ summary: 'Stored.', action: 'stored', memoryBodyIds: ['project'] })
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value)
+    await coordinator.remember(parent(), { content: 'Use SQLite.' }, new AbortController().signal)
+    await coordinator.remember(parent(), { content: 'Use bounded retries.' }, new AbortController().signal)
+    expect(resultTools.register).toHaveBeenCalledOnce()
+    expect(resultTools.definitions[0]?.name).toBe('mnemon_subagent_result')
+    expect(host.start).toHaveBeenNthCalledWith(1, 'spawn', expect.objectContaining({ toolFilter: { allow: expect.arrayContaining(['mnemon_subagent_result']) } }))
+    expect(host.start).toHaveBeenNthCalledWith(2, 'spawn', expect.objectContaining({ toolFilter: { allow: expect.arrayContaining(['mnemon_subagent_result']) } }))
+    expect(resultTools.disposers[0]).not.toHaveBeenCalled()
+    coordinator.dispose()
+    coordinator.dispose()
+    expect(resultTools.disposers[0]).toHaveBeenCalledOnce()
+  })
+
+  it('isolates concurrent result capabilities and rejects stale or foreign submissions', async () => {
+    const resultTools = toolRegistry()
+    const starts: Array<{ request: Parameters<HostSubagentsService['start']>[1]; child: HostAgent; done: ReturnType<typeof Promise.withResolvers<{ output: []; stopReason: string }>> }> = []
+    const host = {
+      list: () => ['spawn'], getProvider: () => ({ capabilities }),
+      start: vi.fn(async (_provider: string, request: Parameters<HostSubagentsService['start']>[1]) => {
+        const child = { ...parent('subagent'), id: 'child-' + starts.length }
+        const done = Promise.withResolvers<{ output: []; stopReason: string }>()
+        starts.push({ request, child, done })
+        return { id: child.id, result: done.promise, dispose: async () => {} }
+      }),
+    } as unknown as HostSubagentsService
+    const coordinator = new MnemonSubagentCoordinator(host, runtimeSource(), resultTools.value)
+    const definition = resultTools.definitions[0]!
+    const fingerprint = JSON.stringify(definition.parameters)
+    const calls = [
+      coordinator.remember(parent(), { content: 'first' }, new AbortController().signal),
+      coordinator.remember({ ...parent(), id: 'other-parent' }, { content: 'second' }, new AbortController().signal),
+    ]
+    calls.forEach(call => { void call.catch(() => {}) })
+    try {
+      await vi.waitFor(() => expect(starts).toHaveLength(2))
+      const first = starts[0]!
+      const second = starts[1]!
+      const result = { summary: 'First result.', action: 'skipped', memoryBodyIds: [] }
+      const firstArgs = resultArguments(first.request, result)
+      const execution = { name: definition.name, agent: first.child, signal: new AbortController().signal, concludeTurn: vi.fn(), token: Symbol('first') }
+      await expect(definition.execute(firstArgs as never, { ...execution, agent: parent() })).rejects.toThrow('restricted to delegated children')
+      await expect(definition.execute({ ...firstArgs, requestId: 'unknown' } as never, execution)).rejects.toThrow('no longer active')
+      await expect(definition.execute(firstArgs as never, { ...execution, agent: second.child })).rejects.toThrow('different child')
+      expect(execution.concludeTurn).not.toHaveBeenCalled()
+      await definition.execute(firstArgs as never, execution)
+      resultTools.emit('tools/result', execution, { isError: false })
+      await expect(definition.execute(firstArgs as never, { ...execution, token: Symbol('duplicate') })).rejects.toThrow('already recorded')
+      const secondExecution = { ...execution, agent: second.child, token: Symbol('second'), concludeTurn: vi.fn() }
+      await definition.execute(resultArguments(second.request, { ...result, summary: 'Second result.' }) as never, secondExecution)
+      resultTools.emit('tools/result', secondExecution, { isError: false })
+      first.done.resolve({ output: [], stopReason: 'completed' })
+      second.done.resolve({ output: [], stopReason: 'completed' })
+      expect(await Promise.all(calls)).toMatchObject([{ summary: 'First result.' }, { summary: 'Second result.' }])
+      await expect(definition.execute(firstArgs as never, execution)).rejects.toThrow('no longer active')
+      expect(resultTools.register).toHaveBeenCalledOnce()
+      expect(JSON.stringify(definition.parameters)).toBe(fingerprint)
+      expect(resultTools.disposers[0]).not.toHaveBeenCalled()
+    } finally {
+      for (const start of starts) start.done.resolve({ output: [], stopReason: 'cancelled' })
+      await Promise.allSettled(calls)
+      await coordinator.dispose()
+    }
+  })
+
+  it.each(['tool', 'outer'])('accepts only an authoritative successful result after a rejected %s execution', async failure => {
+    const resultTools = toolRegistry()
+    const child = { ...parent('subagent'), id: 'result-owner' }
+    const host = {
+      list: () => ['spawn'], getProvider: () => ({ capabilities }),
+      start: vi.fn(async (_provider: string, request: Parameters<HostSubagentsService['start']>[1]) => {
+        const definition = resultTools.definitions[0]!
+        const outer = Symbol('outer')
+        const execution = { name: definition.name, agent: child, signal: new AbortController().signal, concludeTurn: vi.fn(), token: Symbol('first'), ...(failure === 'outer' ? { parent: outer } : {}) }
+        await definition.execute(resultArguments(request, { summary: 'Must not commit.', action: 'skipped', memoryBodyIds: [] }) as never, execution)
+        resultTools.emit('tools/result', execution, { isError: failure === 'tool' })
+        if (failure === 'outer') resultTools.emit('tools/result', { name: 'run_code', agent: child, signal: execution.signal, token: outer }, { isError: true })
+        const retry = { name: definition.name, agent: child, signal: execution.signal, concludeTurn: vi.fn(), token: Symbol('retry') }
+        await definition.execute(resultArguments(request, { summary: 'Authoritative retry.', action: 'skipped', memoryBodyIds: [] }) as never, retry)
+        resultTools.emit('tools/result', retry, { isError: false })
+        return { id: child.id, result: Promise.resolve({ output: [], stopReason: 'completed' }), dispose: async () => {} }
+      }),
+    } as unknown as HostSubagentsService
+    const coordinator = new MnemonSubagentCoordinator(host, runtimeSource(), resultTools.value)
+    try {
+      await expect(coordinator.remember(parent(), { content: 'checkpoint' }, new AbortController().signal)).resolves.toMatchObject({ summary: 'Authoritative retry.' })
+    } finally { await coordinator.dispose() }
+  })
+
+  it('revokes result capabilities before asynchronous child cleanup completes', async () => {
+    const resultTools = toolRegistry()
+    const cleanup = Promise.withResolvers<void>()
+    const host = subagents({ summary: 'Done.', action: 'skipped', memoryBodyIds: [] })
+    host.dispose.mockImplementation(() => cleanup.promise)
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value)
+    const call = coordinator.remember(parent(), { content: 'checkpoint' }, new AbortController().signal)
+    try {
+      await vi.waitFor(() => expect(host.dispose).toHaveBeenCalledOnce())
+      const request = (host.start.mock.calls as unknown as Array<[string, { persona: string }]>)[0]![1]
+      await expect(resultTools.definitions[0]!.execute(resultArguments(request, { summary: 'Late.', action: 'skipped', memoryBodyIds: [] }) as never, {
+        agent: { ...parent('subagent'), id: 'child-run-1' }, signal: new AbortController().signal, concludeTurn: vi.fn(),
+      })).rejects.toThrow('no longer active')
+    } finally {
+      cleanup.resolve()
+      await call
+      await coordinator.dispose()
+    }
+  })
+
+  it('revokes a rejected startup capability while retaining the stable tool for later work', async () => {
+    const resultTools = toolRegistry()
+    const host = subagents({ summary: 'Recovered.', action: 'skipped', memoryBodyIds: [] })
+    host.start.mockRejectedValueOnce(new Error('provider startup failed'))
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value)
+    try {
+      await expect(coordinator.remember(parent(), { content: 'first' }, new AbortController().signal)).rejects.toThrow('provider startup failed')
+      const request = (host.start.mock.calls as unknown as Array<[string, { persona: string }]>)[0]![1]
+      await expect(resultTools.definitions[0]!.execute(resultArguments(request, { summary: 'Late.', action: 'skipped', memoryBodyIds: [] }) as never, {
+        agent: parent('subagent'), signal: new AbortController().signal, concludeTurn: vi.fn(),
+      })).rejects.toThrow('no longer active')
+      await expect(coordinator.remember(parent(), { content: 'second' }, new AbortController().signal)).resolves.toMatchObject({ summary: 'Recovered.' })
+      expect(resultTools.register).toHaveBeenCalledOnce()
+    } finally { await coordinator.dispose() }
+  })
+
+  it('does not reopen a result request when disposed during workflow preparation', async () => {
+    const resultTools = toolRegistry()
+    const source = runtimeSource()
+    const signal = new AbortController().signal
+    const execution = await source.executions.workflow(parent(), 'write', signal)
+    const release = vi.fn(execution.release)
+    const ready = Promise.withResolvers<typeof execution>()
+    const workflow = vi.spyOn(source.executions, 'workflow').mockReturnValueOnce(ready.promise)
+    const host = subagents({ summary: 'Must not start.', action: 'skipped', memoryBodyIds: [] })
+    const coordinator = new MnemonSubagentCoordinator(host.value, source, resultTools.value)
+    const call = coordinator.remember(parent(), { content: 'checkpoint' }, signal)
+    const rejected = expect(call).rejects.toThrow('coordinator is disposed')
+    await vi.waitFor(() => expect(workflow).toHaveBeenCalledOnce())
+    await coordinator.dispose()
+    ready.resolve({ ...execution, release })
+    await rejected
+    expect(host.start).not.toHaveBeenCalled()
+    expect(release).toHaveBeenCalledOnce()
+    expect(resultTools.on).not.toHaveBeenCalled()
+  })
+
+  it('revokes every outstanding capability when the coordinator is disposed', async () => {
+    const resultTools = toolRegistry()
+    const done = Promise.withResolvers<{ output: []; stopReason: string; structured: unknown }>()
+    const host = subagents(undefined)
+    host.start.mockImplementation(async () => ({ id: 'child-run-1', result: done.promise, dispose: host.dispose }))
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value)
+    const call = coordinator.remember(parent(), { content: 'checkpoint' }, new AbortController().signal)
+    void call.catch(() => {})
+    try {
+      await vi.waitFor(() => expect(host.start).toHaveBeenCalledOnce())
+      const request = (host.start.mock.calls as unknown as Array<[string, { persona: string }]>)[0]![1]
+      await coordinator.dispose()
+      await expect(resultTools.definitions[0]!.execute(resultArguments(request, { summary: 'Late.', action: 'skipped', memoryBodyIds: [] }) as never, {
+        agent: { ...parent('subagent'), id: 'child-run-1' }, signal: new AbortController().signal, concludeTurn: vi.fn(),
+      })).rejects.toThrow('no longer active')
+      expect(resultTools.disposers[0]).toHaveBeenCalledOnce()
+    } finally {
+      done.resolve({ output: [], stopReason: 'cancelled', structured: undefined })
+      await expect(call).rejects.toThrow('stopped with cancelled')
+      await coordinator.dispose()
+    }
+  })
+
+  it('rejects submissions after cancellation even before the provider settles', async () => {
+    const resultTools = toolRegistry()
+    const done = Promise.withResolvers<{ output: []; stopReason: string }>()
+    const host = subagents(undefined)
+    host.start.mockImplementation(async () => ({ id: 'child-run-1', result: done.promise.then(value => ({ ...value, structured: undefined })), dispose: host.dispose }))
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value)
+    const controller = new AbortController()
+    const call = coordinator.remember(parent(), { content: 'checkpoint' }, controller.signal)
+    void call.catch(() => {})
+    try {
+      await vi.waitFor(() => expect(host.start).toHaveBeenCalledOnce())
+      const request = (host.start.mock.calls as unknown as Array<[string, { persona: string }]>)[0]![1]
+      controller.abort(new Error('checkpoint cancelled'))
+      await expect(resultTools.definitions[0]!.execute(resultArguments(request, { summary: 'Late.', action: 'skipped', memoryBodyIds: [] }) as never, {
+        agent: { ...parent('subagent'), id: 'child-run-1' }, signal: new AbortController().signal, concludeTurn: vi.fn(),
+      })).rejects.toThrow('checkpoint cancelled')
+    } finally {
+      done.resolve({ output: [], stopReason: 'cancelled' })
+      await expect(call).rejects.toThrow('stopped with cancelled')
+      await coordinator.dispose()
+    }
+  })
+
+  it('captures a schema-validated result through the stable tool without DSH structured output', async () => {
     const resultTools = toolRegistry()
     const dispose = vi.fn(async () => {})
     const concludeTurn = vi.fn()
     const child = parent('subagent')
     child.id = 'child-run-1'
-    const start = vi.fn(async (_provider: string, request: { outputSchema?: unknown; toolFilter?: { allow?: string[] } }) => {
+    const start = vi.fn(async (_provider: string, request: { persona?: string; outputSchema?: unknown; toolFilter?: { allow?: string[] } }) => {
       expect(request.outputSchema).toBeUndefined()
       const definition = resultTools.definitions.at(-1)!
       expect(request.toolFilter?.allow).toContain(definition.name)
       const outerToken = Symbol('run-code')
       const execution = { name: definition.name, token: Symbol('result'), parent: outerToken, agent: child, signal: new AbortController().signal, concludeTurn }
-      await definition.execute({
-        summary: 'Stored in project.',
-        action: 'stored',
-        memoryBodyIds: ['project'],
-      } as never, execution)
-      await expect(definition.execute({
+      await definition.execute(resultArguments(request, {
+        summary: 'Stored in project.', action: 'stored', memoryBodyIds: ['project'],
+      }) as never, execution)
+      await expect(definition.execute(resultArguments(request, {
         summary: 'Duplicate.', action: 'skipped', memoryBodyIds: [],
-      } as never, { ...execution, token: Symbol('duplicate') })).rejects.toThrow('already recorded')
+      }) as never, { ...execution, token: Symbol('duplicate') })).rejects.toThrow('already recorded')
       resultTools.emit('tools/result', execution, { isError: false })
       resultTools.emit('tools/result', { name: 'run_code', token: outerToken, signal: execution.signal, agent: child }, { isError: false })
       return { id: child.id, result: Promise.resolve({ output: [], stopReason: 'completed' }), dispose }
@@ -896,6 +1360,7 @@ describe('Mnemon memory subagent coordinator', () => {
     })
     expect(concludeTurn).toHaveBeenCalledOnce()
     expect(dispose).toHaveBeenCalledOnce()
+    coordinator.dispose()
     for (const disposer of resultTools.disposers) expect(disposer).toHaveBeenCalledOnce()
   })
 
@@ -906,12 +1371,12 @@ describe('Mnemon memory subagent coordinator', () => {
     const host = {
       list: vi.fn(() => ['spawn']),
       getProvider: vi.fn(() => ({ capabilities })),
-      start: vi.fn(async () => {
+      start: vi.fn(async (_provider: string, request: { persona?: string }) => {
         const definition = resultTools.definitions.at(-1)!
         const execution = { name: definition.name, token: Symbol('intruder'), agent: intruder, signal: new AbortController().signal, concludeTurn: vi.fn() }
-        await definition.execute({
+        await definition.execute(resultArguments(request, {
           summary: 'Wrong child.', action: 'skipped', memoryBodyIds: [],
-        } as never, execution)
+        }) as never, execution)
         resultTools.emit('tools/result', execution, { isError: false })
         return { id: 'child-run-1', result: Promise.resolve({ output: [], stopReason: 'completed' }), dispose: vi.fn(async () => {}) }
       }),
@@ -919,6 +1384,7 @@ describe('Mnemon memory subagent coordinator', () => {
     const coordinator = new MnemonSubagentCoordinator(host, runtimeSource(), resultTools.value)
 
     await expect(coordinator.remember(parent(), { content: 'x' }, new AbortController().signal)).rejects.toThrow('recorded by a different child')
+    coordinator.dispose()
     for (const disposer of resultTools.disposers) expect(disposer).toHaveBeenCalledOnce()
   })
 
@@ -929,8 +1395,8 @@ describe('Mnemon memory subagent coordinator', () => {
     const host = {
       list: vi.fn(() => ['spawn']),
       getProvider: vi.fn(() => ({ capabilities })),
-      start: vi.fn(async () => {
-        await resultTools.definitions.at(-1)!.execute({ action: 'stored', memoryBodyIds: [] } as never, {
+      start: vi.fn(async (_provider: string, request: { persona?: string }) => {
+        await resultTools.definitions.at(-1)!.execute(resultArguments(request, { action: 'stored', memoryBodyIds: [] }) as never, {
           agent: child, signal: new AbortController().signal, concludeTurn: vi.fn(),
         })
         throw new Error('unreachable')
@@ -939,6 +1405,7 @@ describe('Mnemon memory subagent coordinator', () => {
     const coordinator = new MnemonSubagentCoordinator(host, runtimeSource(), resultTools.value)
 
     await expect(coordinator.remember(parent(), { content: 'x' }, new AbortController().signal)).rejects.toThrow('result.summary is required')
+    coordinator.dispose()
     for (const disposer of resultTools.disposers) expect(disposer).toHaveBeenCalledOnce()
   })
 
@@ -1062,6 +1529,62 @@ describe('Mnemon memory subagent coordinator', () => {
     expect((host.start.mock.calls[0] as unknown as [string, { prompt: Array<{ text: string }> }])[1].prompt[0]!.text).not.toMatch(/catalog_json|request_json|dbPath/)
   })
 
+  it('excludes destructive forget from autonomous distillation runs (issue 148)', async () => {
+    const host = subagents({ summary: 'Stored in project.', action: 'stored', memoryBodyIds: ['project'] })
+    const coordinator = createCoordinator(host.value)
+    await coordinator.remember(parent(), { content: 'Durable choice' }, new AbortController().signal)
+    const rememberCall = (host.start.mock.calls[0] as unknown as [string, { toolFilter: { allow: string[] }; persona: string }])[1]
+    expect(rememberCall.toolFilter.allow).toContain('mnemon_remember')
+    expect(rememberCall.toolFilter.allow).not.toContain('mnemon_forget')
+    expect(rememberCall.persona).toContain('you cannot and must not delete existing entries')
+  })
+
+  it('recovers a delegated write child whose server refuses a request without a user query (issue 327)', async () => {
+    const host = subagents({ summary: 'Stored in project.', action: 'stored', memoryBodyIds: ['project'] })
+    const registry = toolRegistry()
+    const handlers = new Map<string, (payload: never, next: () => Promise<unknown>) => Promise<unknown>>()
+    const append = vi.fn()
+    const child = { ...parent('subagent'), id: 'child-run-1', session: { ...parent('subagent').session, append }, ctx: { on: (name: string, handler: never) => {
+      handlers.set(name, handler)
+      return () => {}
+    } } } as unknown as HostAgent
+    // DSH publishes the child while the provider starts it.
+    const publishing: HostSubagentsService = { ...host.value, async start(provider, request) {
+      registry.publish(child, request.parent)
+      return host.value.start(provider, request)
+    } }
+    const coordinator = new MnemonSubagentCoordinator(publishing, runtimeSource(), registry.value)
+    await coordinator.remember(parent(), { content: 'Durable choice' }, new AbortController().signal)
+    expect([...handlers.keys()].sort()).toEqual(['agent/pre-step', 'agent/request-error'])
+    const live = new AbortController().signal
+    const step = handlers.get('agent/pre-step')!
+    // Nothing changes before a refusal.
+    await expect(step({ messages: [], step: 2, signal: live } as never, async () => ({ kind: 'enter', messages: [] }))).resolves.toEqual({ kind: 'enter', messages: [] })
+    await expect(handlers.get('agent/request-error')!({ turn: 1, step: 3, failure: { message: 'no user query found in messages', code: 'SERVER_ERROR' }, signal: live } as never, async () => undefined))
+      .resolves.toEqual({ kind: 'retry' })
+    expect(append).toHaveBeenCalledExactlyOnceWith('user/message', expect.objectContaining({ content: [{ type: 'text', text: CONTINUATION_TEXT }] }), { surfaceOp: 'append' })
+    await expect(step({ messages: [], step: 4, signal: live } as never, async () => ({ kind: 'enter', messages: [] })))
+      .resolves.toMatchObject({ kind: 'enter', messages: [{ role: 'user', content: [{ type: 'text', text: CONTINUATION_TEXT }] }] })
+  })
+
+  it('excludes destructive forget from supervised writeback runs (issue 148)', async () => {
+    const host = subagents({ summary: 'Stored in project.', action: 'stored', memoryBodyIds: ['project'] })
+    const coordinator = createCoordinator(host.value)
+    await coordinator.write(parent(), 'supervised-writeback', { content: 'Live user candidate' }, new AbortController().signal)
+    const writebackCall = (host.start.mock.calls[0] as unknown as [string, { toolFilter: { allow: string[] } }])[1]
+    expect(writebackCall.toolFilter.allow).not.toContain('mnemon_forget')
+    expect(writebackCall.toolFilter.allow).toContain('mnemon_remember')
+  })
+
+  it('keeps the forget tool for explicit user forget operations', async () => {
+    const host = subagents({ summary: 'Forgot m1.', action: 'forgotten', memoryBodyIds: ['project'] })
+    const coordinator = createCoordinator(host.value)
+    await coordinator.write(parent(), 'forget', { id: 'm1' }, new AbortController().signal)
+    const forgetCall = (host.start.mock.calls[0] as unknown as [string, { toolFilter: { allow: string[] }; persona: string }])[1]
+    expect(forgetCall.toolFilter.allow).toContain('mnemon_forget')
+    expect(forgetCall.persona).not.toContain('you cannot and must not delete existing entries')
+  })
+
   it('selects a provider in a tool-free child and keeps user policy out of the persona', async () => {
     const host = subagents({
       providerId: 'work-account',
@@ -1070,6 +1593,23 @@ describe('Mnemon memory subagent coordinator', () => {
     })
     const resultTools = toolRegistry()
     const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value)
+    host.start.mockImplementation(async (...args: unknown[]) => {
+      const request = args[1] as { persona?: string }
+      const definition = resultTools.definitions[0]!
+      const execution = { name: definition.name, agent: { ...parent('subagent'), id: 'child-run-1' }, signal: new AbortController().signal, concludeTurn: vi.fn(), token: Symbol('placement') }
+      await expect(definition.execute(resultArguments(request, {
+        summary: 'A write envelope cannot complete placement.', action: 'skipped', memoryBodyIds: [],
+      }) as never, execution)).rejects.toThrow('result.providerId is required')
+      await expect(definition.execute(resultArguments(request, {
+        providerId: 'unavailable-account', reason: 'Not eligible.', confidence: 'high',
+      }) as never, execution)).rejects.toThrow('result.providerId is not an allowed value')
+      expect(execution.concludeTurn).not.toHaveBeenCalled()
+      await definition.execute(resultArguments(request, {
+        providerId: 'work-account', reason: 'A shared remote scope matches this team knowledge body.', confidence: 'high',
+      }) as never, execution)
+      resultTools.emit('tools/result', execution, { isError: false })
+      return { id: 'child-run-1', result: Promise.resolve({ output: [], structured: undefined, stopReason: 'completed' }), dispose: host.dispose }
+    })
     const placementCandidates: MemoryPlacementCandidate[] = [
       {
         id: 'mnemon-native', label: 'Mnemon Native', kind: 'local', configured: true, summary: 'Local exact memory.',
@@ -1094,7 +1634,7 @@ describe('Mnemon memory subagent coordinator', () => {
     })
 
     expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({
-      toolFilter: { allow: [expect.stringMatching(/^mnemon_subagent_result_/)] },
+      toolFilter: { allow: ['mnemon_subagent_result'] },
       maxDepth: 1,
       persona: expect.stringContaining('host-filtered eligible list'),
     }))
@@ -1102,9 +1642,10 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(request.prompt[0]!.text).toContain('团队知识优先团队 Provider。')
     expect(request.persona).not.toContain('团队知识优先团队 Provider。')
     expect(request.persona).not.toMatch(/api.?key|endpoint|secret/iu)
-    expect((resultTools.definitions[0] as unknown as { parameters: { properties: { providerId: { enum: string[] } } } }).parameters.properties.providerId.enum)
+    expect(delegatedResultSchema((host.start.mock.calls as unknown as Array<[string, { persona: string }] >)[0]![1]).properties.providerId?.enum)
       .toEqual(['mnemon-native', 'work-account'])
     expect(coordinator.snapshot()).toMatchObject({ placements: 1, lastOperation: 'placement' })
+    await coordinator.dispose()
   })
 
   it('curates metadata in a read-only child and keeps valid entries when another candidate is invalid', async () => {
@@ -1125,7 +1666,7 @@ describe('Mnemon memory subagent coordinator', () => {
       updates: [{ memoryBodyId: 'product', title: '产品决策' }],
     })
     expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({
-      toolFilter: { allow: [expect.stringMatching(/^mnemon_subagent_result_/)] },
+      toolFilter: { allow: ['mnemon_subagent_result'] },
       agentOptions: { maxTokens: 4_096 },
       persona: expect.stringContaining('fastest bounded metadata-sampling path'),
     }))
@@ -1146,9 +1687,87 @@ describe('Mnemon memory subagent coordinator', () => {
     await expect(createCoordinator(invalid.value, runtime).maintainMetadata(parent(), ['product'], new AbortController().signal)).resolves.toMatchObject({ updates: [] })
   })
 
+  it('reviews without a fork provider using bounded spawn context (issue 255)', async () => {
+    const host = subagents({ summary: 'No mutation needed.', action: 'skipped', memoryBodyIds: [] })
+    const coordinator = createCoordinator(host.value)
+    await expect(coordinator.review(parent(), new AbortController().signal)).resolves.toMatchObject({ provider: 'spawn', action: 'skipped' })
+    expect(host.start).toHaveBeenCalledOnce()
+    expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({ agentOptions: { maxTokens: 4096 } }))
+  })
+
+  it.each(['spawn', 'fork'] as const)('keeps scoped Team %s startup failures closed without replay (issue 275)', async provider => {
+    const host = subagents(undefined, 'error', ['spawn', 'fork'])
+    host.start.mockRejectedValueOnce(new Error('Team policy startup failed'))
+    const runtime = runtimeSource()
+    Object.assign(runtime.config.idleReview, { provider, agentTeams: 'scoped' })
+    const coordinator = createCoordinator(host.value, runtime)
+    const lead = parent()
+    lead.ctx = { get: () => ({}), tools: { get: () => ({}) } } as never
+    await expect(coordinator.review(lead, new AbortController().signal)).rejects.toMatchObject({
+      message: 'Team policy startup failed', review: { status: 'failed', provider, receipts: [] },
+    })
+    expect(host.start).toHaveBeenCalledOnce()
+    expect(coordinator.snapshot()).toMatchObject({ reviews: 0, failures: 1 })
+    const request = host.start.mock.calls[0]![1]!
+    expect(request.maxDepth).toBe(1)
+    expect(request.toolFilter?.allow).not.toEqual(expect.arrayContaining(['spawn_teammate']))
+    expect(request.persona).toContain('Those capabilities remain unavailable')
+  })
+
+  it.each(['spawn', 'skip'] as const)('handles an unavailable fork before startup with %s policy', async fallback => {
+    const host = subagents({ summary: 'No mutation.', action: 'skipped', memoryBodyIds: [] })
+    const runtime = runtimeSource()
+    Object.assign(runtime.config.idleReview, { provider: 'fork', fallback })
+    const coordinator = createCoordinator(host.value, runtime)
+    await expect(coordinator.review(parent(), new AbortController().signal)).resolves.toMatchObject({ delegated: fallback === 'spawn', action: 'skipped' })
+    expect(host.start).toHaveBeenCalledTimes(fallback === 'spawn' ? 1 : 0)
+    expect(coordinator.snapshot().failures).toBe(0)
+  })
+
+  it('does not report review success when child disposal fails', async () => {
+    const host = subagents({ summary: 'No mutation.', action: 'skipped', memoryBodyIds: [] })
+    host.dispose.mockRejectedValueOnce(new Error('child disposal failed'))
+    const coordinator = createCoordinator(host.value)
+    await expect(coordinator.review(parent(), new AbortController().signal)).rejects.toMatchObject({
+      message: 'child disposal failed', review: { status: 'failed', receipts: [] },
+    })
+    expect(coordinator.snapshot()).toMatchObject({ failures: 1, reviews: 0 })
+  })
+
+  it.each([false, true])('retains own committed receipts after a failed review without replay, Code Mode=%s', async codeMode => {
+    const registry = toolRegistry()
+    const child = { ...parent('subagent'), id: 'review-child', ctx: { tools: { guard: () => () => {} } } } as unknown as HostAgent
+    const host = subagents(undefined, 'error', ['fork', 'spawn'])
+    host.start.mockImplementationOnce(async (_provider, request) => {
+      registry.publish(child, request!.parent)
+      const token = Symbol('outer Code Mode')
+      const committed = { action: 'created', document: { id: 'document-committed' }, memoryReceipt: { completion: 'committed', status: 'succeeded', committedAt: '2026-09-16T00:00:00Z' } }
+      registry.emit('tools/result', { agent: child, name: 'mnemon_document_create', arguments: { title: 'private title' }, ...(codeMode ? { parent: token } : {}) }, { value: committed })
+      registry.emit('tools/result', { agent: { ...child, id: 'unrelated-child' }, name: 'mnemon_document_create' }, { value: { ...committed, document: { id: 'unrelated-document' } } })
+      registry.emit('tools/result', { agent: child, name: 'mnemon_runtime_memory', arguments: { target: 'memory' } }, { value: { action: 'added', revision: 'runtime-revision' } })
+      registry.emit('tools/result', { agent: child, name: 'mnemon_runtime_memory' }, { value: { action: 'added' }, isError: true })
+      if (codeMode) registry.emit('tools/result', { agent: child, name: 'run_code', token }, { isError: true })
+      return { id: child.id, localAgent: child, result: Promise.resolve({ output: [], structured: undefined, stopReason: 'error', diagnostic: 'TeamError: lost membership' }), dispose: host.dispose }
+    })
+    const runtime = runtimeSource()
+    runtime.config.idleReview.provider = 'fork'
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtime, registry.value)
+    await expect(coordinator.review(parent(), new AbortController().signal)).rejects.toMatchObject({
+      message: expect.stringContaining('TeamError'), review: { status: 'partial', runId: child.id, provider: 'fork', receipts: [
+        { tool: 'mnemon_document_create', action: 'created', documentId: 'document-committed' },
+        { tool: 'mnemon_runtime_memory', action: 'added', target: 'memory', revision: 'runtime-revision' },
+      ] },
+    })
+    expect(host.start).toHaveBeenCalledOnce()
+    expect(host.dispose).toHaveBeenCalledOnce()
+    expect(coordinator.snapshot()).toMatchObject({ failures: 1, reviews: 0 })
+  })
+
   it('reviews a completed full-context checkpoint through fork with a maintenance-only tool set', async () => {
     const host = subagents({ summary: 'No mutation needed.', action: 'skipped', memoryBodyIds: [] }, 'completed', ['spawn', 'fork'])
-    const coordinator = createCoordinator(host.value)
+    const runtime = runtimeSource()
+    runtime.config.idleReview.provider = 'fork'
+    const coordinator = createCoordinator(host.value, runtime)
 
     await expect(coordinator.review(parent(), new AbortController().signal)).resolves.toMatchObject({
       delegated: true,
@@ -1156,19 +1775,72 @@ describe('Mnemon memory subagent coordinator', () => {
       action: 'skipped',
     })
     expect(host.start).toHaveBeenCalledWith('fork', expect.objectContaining({
-      toolFilter: { allow: expect.arrayContaining(['mnemon_document_search', 'mnemon_runtime_memory', 'mnemon_document_manage']) },
+      toolFilter: { allow: expect.arrayContaining(['mnemon_document_search', 'mnemon_runtime_memory', 'mnemon_document_create']) },
       persona: expect.stringContaining('idle checkpoint reviewer'),
       prompt: [{ type: 'text', text: 'Review the inherited completed checkpoint now.' }],
     }))
     const reviewCall = (host.start.mock.calls[0] as unknown as [string, { persona: string; toolFilter: { allow: string[] } }])[1]
     expect(reviewCall.persona).toContain('Never move a document to cold archive in this pass')
     expect(reviewCall.persona).toContain('Deep Recall is unavailable after the parent TurnView closes')
+    expect(reviewCall.persona).toContain('Reuse complete evidence already present in the inherited checkpoint')
+    expect(reviewCall.persona).toContain('skip the candidate when that is insufficient')
     expect(reviewCall.persona).not.toContain('Memory View')
+    expect(reviewCall.persona).toContain('Never update or replace an existing document')
+    expect(reviewCall.toolFilter.allow).not.toContain('mnemon_document_manage')
+    expect(reviewCall.toolFilter.allow).not.toContain('mnemon_view_action')
+    expect(reviewCall.toolFilter.allow).not.toContain('mnemon_forget')
     expect(reviewCall.toolFilter.allow).not.toContain('mnemon_recall')
     expect(reviewCall.toolFilter.allow).not.toContain('mnemon_related')
     expect(reviewCall.toolFilter.allow).not.toContain('mnemon_memory_bodies')
     expect(reviewCall.toolFilter.allow).not.toContain('mnemon_memory_zoom')
     expect(coordinator.snapshot()).toMatchObject({ reviews: 1, writes: 0, lastOperation: 'review' })
+  })
+
+  it('keeps project records out of hot memory and considers a Document first (#319)', async () => {
+    const host = subagents({ summary: 'No mutation needed.', action: 'skipped', memoryBodyIds: [] })
+    const coordinator = createCoordinator(host.value)
+    await coordinator.review(parent(), new AbortController().signal)
+    const { persona } = (host.start.mock.calls[0] as unknown as [string, { persona: string }])[1]
+    expect(persona).toContain('Record each piece of knowledge in one layer')
+    expect(persona).toContain('Project records never qualify')
+    expect(persona).toContain('target=memory only for a compact rule the user stated')
+    expect(persona).not.toContain('stable project, environment, decisions')
+    expect(persona.indexOf('Project Documents:')).toBeLessThan(persona.indexOf('Hot memory is loaded'))
+    // The bounded spawn checkpoint keeps its own wording.
+    expect(persona).toContain('Reuse complete evidence already present in the supplied bounded checkpoint')
+  })
+
+  it('refuses a second layer inside one review pass through the child guard (#319)', async () => {
+    const host = subagents({ summary: 'Created one document.', action: 'created', memoryBodyIds: [] })
+    const registry = toolRegistry()
+    let guard: ((execution: ToolExecution) => string | undefined) | undefined
+    const published: HostSubagentsService = { ...host.value, async start(provider, request) {
+      const run = await host.value.start(provider, request)
+      const child = { ...parent('subagent'), id: run.id, ctx: { tools: { guard: (callback: typeof guard) => { guard = callback; return () => {} } } } } as unknown as HostAgent
+      registry.publish(child, request.parent)
+      return { ...run, localAgent: child }
+    } }
+    const coordinator = new MnemonSubagentCoordinator(published, runtimeSource(), registry.value)
+    await coordinator.review(parent(), new AbortController().signal)
+    const call = (name: string, args: unknown) => guard!({ name, arguments: args, signal: new AbortController().signal })
+    expect(call('mnemon_document_search', { query: 'boot account resolution' })).toBeUndefined()
+    expect(call('mnemon_document_create', { title: 'Boot account resolution' })).toBeUndefined()
+    expect(call('mnemon_runtime_memory', { action: 'add', target: 'user', content: 'Prefers short answers.' })).toBeUndefined()
+    expect(call('mnemon_runtime_memory', { action: 'add', target: 'memory', content: 'Boot entries never run the panel as root.' })).toContain('already created a Document')
+  })
+
+  it('withholds runtime memory from idle review when it is switched off', async () => {
+    const host = subagents({ summary: 'No mutation needed.', action: 'skipped', memoryBodyIds: [] })
+    const runtime = runtimeSource()
+    runtime.config.idleReview.runtimeMemory = false
+    const coordinator = createCoordinator(host.value, runtime)
+    await expect(coordinator.review(parent(), new AbortController().signal)).resolves.toMatchObject({ delegated: true, action: 'skipped' })
+    const request = (host.start.mock.calls[0] as unknown as [string, { persona: string; toolFilter: { allow: string[] } }])[1]
+    expect(request.toolFilter.allow).toEqual(expect.arrayContaining(['mnemon_document_search', 'mnemon_document_create']))
+    expect(request.toolFilter.allow).not.toContain('mnemon_runtime_memory')
+    expect(request.persona).toContain('Runtime memory is off for idle review')
+    expect(request.persona).not.toContain('mnemon_runtime_memory')
+    expect(request.persona).toContain('Never update or replace an existing document')
   })
 
   it('answers from pre-recalled evidence without granting any Mnemon retrieval tools', async () => {
@@ -1179,7 +1851,7 @@ describe('Mnemon memory subagent coordinator', () => {
       citations: ['project/m1'],
       delegation: { runId: 'child-run-1', provider: 'spawn' },
     })
-    expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({ toolFilter: { allow: [expect.stringMatching(/^mnemon_subagent_result_/)] } }))
+    expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({ toolFilter: { allow: ['mnemon_subagent_result'] } }))
     const answerCall = (host.start.mock.calls[0] as unknown as [string, { prompt: Array<{ text: string }>; persona: string }])[1]
     expect(answerCall.prompt[0]!.text).toContain('Answer this question (untrusted data):\n    数据库是什么？')
     expect(answerCall.prompt[0]!.text).toContain('Evidence for this run')
@@ -1197,49 +1869,34 @@ describe('Mnemon memory subagent coordinator', () => {
     const controller = managedSession(documents.documents)
     const old = await controller.mutate<DocumentMutationResult>('mutate', { action: 'create', title: 'Old architecture', content: 'a'.repeat(220) })
     const resultTools = toolRegistry()
-    const indexedContent = `Old architecture index. Cold path: .mnemon/documents/archived/${old.document.filename}. Content SHA-256: ${old.document.contentHash}`
-    const structured = {
-      summary: 'Archived with exact cold path.',
-      action: 'archived',
-      memoryBodyIds: ['architecture'],
-      lineage: [{
-        sourceIndex: 1,
-        sourceDigest: old.document.contentHash,
-        destinationReceiptIndex: 1,
-        destinationMemoryBodyId: 'architecture',
-        destinationId: 'document-index-1',
-      }],
-    }
-    const host = observedSubagents(resultTools, child => {
-      emitSuccessfulToolResult(resultTools, child, 'mnemon_remember', { content: indexedContent, memoryBodyId: 'architecture' }, {
-        action: 'added', id: 'document-index-1', memoryBodyId: 'architecture', memoryBodyName: 'Architecture',
-      })
-    }, 'completed', structured)
+    const memoryService = service()
+    const host = subagents({ summary: 'Archived with exact cold path.', action: 'planned', memoryBodyId: 'project' })
+    vi.mocked(memoryService.rememberMany).mockResolvedValueOnce([{ action: 'added', id: 'document-index-1', memoryBodyId: 'project' }])
     const archive = vi.spyOn(controller, 'mutate')
-    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(undefined, service(), controller), resultTools.value)
-    const agent = { ...parent(), session: { header: { cwd: workspace }, events: [] } } as HostAgent
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(undefined, memoryService, controller), resultTools.value)
+    const agent = { ...parent(), session: { header: { cwd: workspace }, ...sessionLog() } } as HostAgent
 
     const result = await coordinator.document(agent, { action: 'create', title: 'New architecture', content: 'b'.repeat(220) }, new AbortController().signal)
     expect(result).toMatchObject({
       action: 'created',
-      maintenance: { archivedDocumentIds: [old.document.id], memoryBodyIds: ['architecture'] },
+      maintenance: { archivedDocumentIds: [old.document.id], memoryBodyIds: ['project'] },
     })
     expect(await controller.read<DocumentView>('document', { id: old.document.id })).toMatchObject({ status: 'archived', archiveSummary: 'Archived with exact cold path.' })
     expect(archive).toHaveBeenCalledWith('archive', expect.objectContaining({
       id: old.document.id, documentRevision: old.document.revision,
-      memoryBodyIds: ['architecture'],
+      memoryBodyIds: ['project'],
       lineage: [{
         source: { layerId: 'documents', reference: `document:${old.document.id}:${old.document.revision}`, digest: old.document.contentHash },
         destination: {
           layerId: 'memory-spaces',
-          reference: 'memory-space:architecture/item:document-index-1',
-          digest: createHash('sha256').update(indexedContent).digest('hex'),
+          reference: 'memory-space:project/item:document-index-1',
+          digest: createHash('sha256').update(vi.mocked(memoryService.rememberMany).mock.calls[0]![0][0]!.content).digest('hex'),
         },
       }],
     }), expect.any(AbortSignal))
     expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({
-      persona: expect.stringContaining('cold-document archive worker'),
-      toolFilter: { allow: expect.arrayContaining(['mnemon_memory_bodies', 'mnemon_recall', 'mnemon_remember', 'mnemon_memory_body_create']) },
+      persona: expect.stringContaining('cold-document archive planner'),
+      toolFilter: { allow: ['mnemon_subagent_result'] },
     }))
     const archiveCall = (host.start.mock.calls[0] as unknown as [string, { prompt: Array<{ text: string }>; persona: string }])[1]
     expect(archiveCall.prompt[0]!.text).toContain(`.mnemon/documents/archived/${old.document.filename}`)
@@ -1247,38 +1904,16 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(coordinator.snapshot()).toMatchObject({ documentArchives: 1, lastOperation: 'document-archive' })
   })
 
-  it('keeps a document active when its destination receipt omits the exact cold reference', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-mnemon-document-lineage-'))
-    temporaryDirectories.push(workspace)
-    const documents = await sourceFixture({ dataDir: join(workspace, '.mnemon'), workspace })
-    releases.push(documents.dispose)
-    const controller = managedSession(documents.documents)
-    const created = await controller.mutate<DocumentMutationResult>('mutate', { action: 'create', title: 'Release gates', content: 'Canary before production.' })
-    const resultTools = toolRegistry()
-    const host = observedSubagents(resultTools, child => {
-      emitSuccessfulToolResult(resultTools, child, 'mnemon_remember', { content: 'An unrelated release note.', memoryBodyId: 'release' }, {
-        action: 'added', id: 'release-note-1', memoryBodyId: 'release', memoryBodyName: 'Release',
-      })
-    }, 'completed', {
-      summary: 'Indexed.',
-      action: 'archived',
-      memoryBodyIds: ['release'],
-      lineage: [{
-        sourceIndex: 1,
-        sourceDigest: created.document.contentHash,
-        destinationReceiptIndex: 1,
-        destinationMemoryBodyId: 'release',
-        destinationId: 'release-note-1',
-      }],
-    })
-    const archive = vi.spyOn(controller, 'mutate')
-    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(undefined, service(), controller), resultTools.value)
-    const agent = { ...parent(), session: { header: { cwd: workspace }, events: [] } } as HostAgent
-
-    await expect(coordinator.archiveDocument(agent, created.document.id, new AbortController().signal))
-      .rejects.toThrow('does not contain the exact cold path and content digest')
-    expect(archive).not.toHaveBeenCalled()
-    expect((await controller.read<DocumentView>('document', { id: created.document.id })).status).toBe('active')
+  it('does not accept a near-match or another space as an existing document index', async () => {
+    const f = await documentArchiveFixture()
+    const cold = `.mnemon/documents/archived/${f.document.filename}`
+    vi.mocked(f.spaces.search).mockResolvedValue({ query: '', mode: 'keyword', results: [
+      { id: 'near-match', content: `Old revision ${cold} wrong-digest`, memoryBodyId: 'project' },
+      { id: 'wrong-space', content: `${cold} ${f.document.contentHash}`, memoryBodyId: 'other' },
+    ] as Insight[] })
+    await expect(f.archive()).resolves.toMatchObject({ action: 'archived' })
+    expect(f.spaces.rememberMany).toHaveBeenCalledOnce()
+    expect(f.spaces.forget).not.toHaveBeenCalled()
   })
 
   it('uses bounded routing excerpts, then batch-archives exact sources and commits atomically', async () => {
@@ -1314,7 +1949,7 @@ describe('Mnemon memory subagent coordinator', () => {
       maintenance: { kind: 'mnemon-archive', provider: 'spawn', memoryBodyIds: ['project'] },
     })
     expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({
-      toolFilter: { allow: [expect.stringMatching(/^mnemon_subagent_result_/)] },
+      toolFilter: { allow: ['mnemon_subagent_result'] },
       agentOptions: { maxTokens: 8_192 },
     }))
     const migrationCall = (host.start.mock.calls[0] as unknown as [string, { prompt: Array<{ text: string }>; persona: string; toolFilter: { allow: string[] } }])[1]
@@ -1336,7 +1971,7 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(migrationCall.persona).toContain('Do not call task tools')
     expect(migrationCall.persona).not.toContain('<runtime-memory-routing-excerpts>')
     expect(migrationPrompt).not.toMatch(/catalog_json|runtime_entries_json|pending_mutation_json|current_usage_json|created_at|markdownPath|dbPath/)
-    const resultSchema = (resultTools.definitions[0] as unknown as { parameters: unknown }).parameters
+    const resultSchema = delegatedResultSchema(migrationCall)
     expect(JSON.stringify(resultSchema)).not.toContain('compactedEntries')
     expect(memoryService.rememberMany).toHaveBeenCalledOnce()
     expect(memoryService.rememberMany).toHaveBeenCalledWith([
@@ -1413,6 +2048,153 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(runtime.compactAndMutate).not.toHaveBeenCalled()
   })
 
+  it.each(['async-extracting', 'no-forget'])('preflights runtime archive destinations before side effects (issue 240): %s', async capability => {
+    const plan = maintenancePlan()
+    const runtime = {
+      mutate: vi.fn().mockRejectedValue(capacityError('memory', plan.used, plan.projected, plan.limit)),
+      planMaintenance: vi.fn(async () => plan),
+      compactAndMutate: vi.fn(),
+    } as unknown as RuntimeOperations
+    const spaces = service()
+    const body = spaces.bodyDirectory().items[0]!
+    if (capability === 'async-extracting') body.provider.capabilities.writeMode = 'async-extracting'
+    else body.provider.capabilities.forget = false
+    vi.mocked(spaces.rememberMany).mockImplementation(async requests => requests.map(() => ({ action: 'queued', operationId: 'accepted-before-error' })))
+    const host = subagents(undefined)
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(runtime, spaces), toolRegistry().value)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(coordinator.runtime(parent(), { action: 'add', target: 'memory', content: plan.pending!.content }, new AbortController().signal))
+        .rejects.toThrow(/exact writes.*safe forget.*memoryLimitBytes/)
+    }
+    expect(spaces.rememberMany).not.toHaveBeenCalled()
+    expect(spaces.forget).not.toHaveBeenCalled()
+    expect(runtime.compactAndMutate).not.toHaveBeenCalled()
+    expect(host.start).not.toHaveBeenCalled()
+  })
+
+  it('uses only the safe destination in a mixed exact and async Provider catalog', async () => {
+    const f = runtimeArchiveFixture()
+    addSecondWritableBody(f.spaces)
+    f.spaces.bodyDirectory().items[1]!.provider = { ...f.spaces.bodyDirectory().items[1]!.provider,
+      id: 'hindsight', capabilities: { ...f.spaces.bodyDirectory().items[1]!.provider.capabilities, writeMode: 'async-extracting' } }
+    await expect(f.archive()).resolves.toMatchObject({ maintenance: { memoryBodyIds: ['project'], provider: 'host' } })
+    expect(vi.mocked(f.spaces.rememberMany).mock.calls.flatMap(([requests]) => requests.map(item => item.memoryBodyId))).toEqual(['project', 'project'])
+    expect(f.host.start).not.toHaveBeenCalled()
+  })
+
+  it('rechecks every destination before starting the first archive write', async () => {
+    const f = runtimeArchiveFixture()
+    const catalog = f.spaces.bodyDirectory()
+    vi.mocked(f.spaces.bodyDirectory).mockReturnValueOnce(catalog).mockReturnValue({ ...catalog, items: [] })
+    await expect(f.archive()).rejects.toThrow('no longer eligible; no archive writes were attempted')
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+  })
+
+  it('rechecks the fallback destination when an invalid routing response follows deactivation', async () => {
+    const f = runtimeArchiveFixture()
+    addSecondWritableBody(f.spaces)
+    f.host.start.mockImplementationOnce(async () => {
+      f.spaces.bodyDirectory().items[0]!.active = false
+      return { id: 'invalid-after-deactivation', result: Promise.resolve({ output: [], stopReason: 'completed', structured: {
+        action: 'planned', summary: 'Invalid routing after destination deactivation.', routes: [],
+      } }), dispose: vi.fn(async () => {}) }
+    })
+    await expect(f.archive()).rejects.toThrow('no longer eligible; no archive writes were attempted')
+    expect(f.host.start).toHaveBeenCalledOnce()
+    expect(f.spaces.rememberMany).not.toHaveBeenCalled()
+    expect(f.runtime.compactAndMutate).not.toHaveBeenCalled()
+  })
+
+  it('cleans every proven-new receipt when a later archive receipt is invalid', async () => {
+    const f = runtimeArchiveFixture()
+    vi.mocked(f.spaces.rememberMany).mockResolvedValueOnce([
+      { action: 'added', id: 'new-index', memoryBodyId: 'project' },
+      { action: 'queued', operationId: 'unknown-index', memoryBodyId: 'project' },
+    ])
+    await expect(f.archive()).rejects.toThrow('did not commit synchronously')
+    expect(f.spaces.forget).toHaveBeenCalledExactlyOnceWith('new-index', expect.any(AbortSignal), 'project')
+    expect(f.runtime.compactAndMutate).not.toHaveBeenCalled()
+  })
+
+  it('compensates an earlier destination when a later Provider write throws', async () => {
+    const f = runtimeArchiveFixture()
+    addSecondWritableBody(f.spaces)
+    f.host.start.mockResolvedValueOnce({ id: 'two-spaces', result: Promise.resolve({ output: [], stopReason: 'completed', structured: {
+      action: 'planned', summary: 'Split archive.', routes: [{ sourceIndexes: [1], memoryBodyId: 'project' }, { sourceIndexes: [2], memoryBodyId: 'release' }],
+    } }), dispose: vi.fn(async () => {}) })
+    vi.mocked(f.spaces.rememberMany).mockResolvedValueOnce([{ action: 'added', id: 'first-destination', memoryBodyId: 'project' }]).mockRejectedValueOnce(new Error('later Provider unavailable'))
+    await expect(f.archive()).rejects.toThrow('later Provider unavailable')
+    expect(f.spaces.forget).toHaveBeenCalledExactlyOnceWith('first-destination', expect.any(AbortSignal), 'project')
+    expect(f.runtime.compactAndMutate).not.toHaveBeenCalled()
+  })
+
+  it('cleans new entries after local commit failure but preserves skipped pre-existing entries', async () => {
+    const f = runtimeArchiveFixture()
+    vi.mocked(f.spaces.rememberMany).mockResolvedValueOnce([
+      { action: 'skipped', id: 'pre-existing', memoryBodyId: 'project' },
+      { action: 'added', id: 'new-index', memoryBodyId: 'project' },
+    ])
+    vi.mocked(f.spaces.search).mockResolvedValueOnce({ query: '', mode: 'smart', results: [{ id: 'pre-existing', content: f.plan.entries[0]!.content, memoryBodyId: 'project' } as Insight] })
+    vi.mocked(f.runtime.compactAndMutate).mockRejectedValueOnce(new Error('local commit failed'))
+    await expect(f.archive()).rejects.toThrow('local commit failed')
+    expect(f.spaces.forget).toHaveBeenCalledExactlyOnceWith('new-index', expect.any(AbortSignal), 'project')
+  })
+
+  it('cleans received entries with an independent signal when the caller cancels', async () => {
+    const f = runtimeArchiveFixture()
+    const abort = new AbortController()
+    vi.mocked(f.spaces.rememberMany).mockImplementationOnce(async requests => {
+      abort.abort(new Error('caller canceled'))
+      return requests.map((_request, index) => ({ action: 'added', id: `new-${index}`, memoryBodyId: 'project' }))
+    })
+    await expect(f.archive(abort.signal)).rejects.toThrow('caller canceled')
+    expect(f.spaces.forget).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(f.spaces.forget).mock.calls.every(([, signal]) => signal?.aborted === false)).toBe(true)
+  })
+
+  it('reports failed cleanup and still attempts the remaining created entries', async () => {
+    const f = runtimeArchiveFixture()
+    vi.mocked(f.runtime.compactAndMutate).mockRejectedValueOnce(new Error('local commit failed'))
+    vi.mocked(f.spaces.forget).mockRejectedValueOnce(new Error('cleanup unavailable'))
+    await expect(f.archive()).rejects.toThrow(/cleanup failed.*project.*stored-/)
+    expect(f.spaces.forget).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['changed', 'unavailable'])('preserves archive entries when the local commit outcome is uncertain: %s', async state => {
+    const f = runtimeArchiveFixture()
+    vi.mocked(f.runtime.compactAndMutate).mockRejectedValueOnce(new Error('transport failed after commit'))
+    vi.mocked(f.runtime.planMaintenance).mockResolvedValueOnce(f.plan).mockResolvedValueOnce(f.plan)
+    if (state === 'changed') vi.mocked(f.runtime.planMaintenance).mockResolvedValueOnce({ ...f.plan, revision: 'committed-revision' })
+    else vi.mocked(f.runtime.planMaintenance).mockRejectedValueOnce(new Error('runtime unavailable'))
+    await expect(f.archive()).rejects.toThrow('uncertain local commit; preserve Memory Space entries')
+    expect(f.spaces.forget).not.toHaveBeenCalled()
+  })
+
+  it('compensates real composed Runtime and Holographic Sources after local commit failure', async () => {
+    const f = await compositionFixture({ runtimeMemory: { memoryLimitBytes: 300 } })
+    releases.push(f.dispose)
+    const body = await f.memorySpace()
+    const spaces = f.graph.source('memory-spaces')
+    await spaces.mutate('body-update', { memoryBodyId: body.id, request: { active: true } })
+    const runtime = f.graph.source('runtime')
+    const content = 'Archive source: ' + 'Keep the source intact. '.repeat(8)
+    await runtime.mutate('mutate', { action: 'add', target: 'memory', content })
+    const before = await runtime.read<RuntimeMemorySnapshot>('snapshot')
+    const coordinator = new MnemonSubagentCoordinator(subagents(undefined).value, f.live, toolRegistry().value)
+    const agent = { ...parent(), session: { header: { cwd: f.workspace }, ...sessionLog() } } as HostAgent
+    const original = SourceSession.prototype.mutateResult
+    const failCommit = vi.spyOn(SourceSession.prototype, 'mutateResult').mockImplementation(function (this: SourceSession, operation, input, signal) {
+      if (this.typeId === 'runtime' && operation === 'compact-and-mutate') return Promise.reject(new Error('injected local commit failure'))
+      return original.call(this, operation, input, signal)
+    })
+    try {
+      await expect(coordinator.runtime(agent, { action: 'add', target: 'memory', content: 'Pending entry: ' + 'Preserve exact facts. '.repeat(5) }, new AbortController().signal)).rejects.toThrow('injected local commit failure')
+    } finally { failCommit.mockRestore() }
+    expect((await runtime.read<RuntimeMemorySnapshot>('snapshot')).revision).toBe(before.revision)
+    const recalled = await spaces.read<{ results: Insight[] }>('search', { query: 'Archive source', memoryBodyIds: [body.id] })
+    expect(recalled.results).toEqual([])
+  })
+
   it('enforces automatic Memory Space write participation before capacity archival', async () => {
     const plan = maintenancePlan()
     const host = subagents(undefined)
@@ -1435,27 +2217,67 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(memoryService.remember).not.toHaveBeenCalled()
   })
 
-  it('rejects incomplete or invalid routes before any Provider write', async () => {
+  it.each([
+    { action: 'planned', summary: 'Incomplete route.', routes: [{ sourceIndexes: [1], memoryBodyId: 'release' }] },
+    { action: 'planned', summary: 'No routes.', routes: [] },
+    { action: 'planned', summary: 'Unknown target.', routes: [{ sourceIndexes: [1, 2], memoryBodyId: 'invented' }] },
+    { action: 'planned', summary: 'Empty target.', routes: [{ sourceIndexes: [1, 2], memoryBodyId: ' ' }] },
+    { action: 'planned', summary: 'No indexes.', routes: [{ sourceIndexes: [], memoryBodyId: 'release' }] },
+    { action: 'planned', summary: 'Duplicate indexes.', routes: [{ sourceIndexes: [1, 1, 2], memoryBodyId: 'release' }] },
+    { action: 'planned', summary: 'Cross-route duplicate.', routes: [{ sourceIndexes: [1], memoryBodyId: 'release' }, { sourceIndexes: [1, 2], memoryBodyId: 'project' }] },
+    { action: 'planned', summary: 'Out of range.', routes: [{ sourceIndexes: [1, 3], memoryBodyId: 'release' }] },
+    { action: 'failed', summary: 'Router cannot choose.', routes: [] },
+    { action: 'planned', summary: 'Noninteger.', routes: [{ sourceIndexes: [1, 2.5], memoryBodyId: 'release' }] },
+  ])('falls back for invalid runtime routing output (issue 235): $summary', async proposal => {
     const plan = maintenancePlan()
-    const host = subagents({
-      summary: 'Incomplete route.',
-      action: 'planned',
-      routes: [{ sourceIndexes: [1], memoryBodyId: 'project' }],
-    })
+    const host = subagents(proposal)
     const runtime = {
       mutate: vi.fn().mockRejectedValueOnce(capacityError('memory', plan.used, plan.projected, plan.limit)),
       planMaintenance: vi.fn(async () => plan),
-      compactAndMutate: vi.fn(),
+      compactAndMutate: vi.fn(async () => ({ success: true, target: 'memory', added: plan.pending!.content, usage: { used: 20, limit: plan.limit } })),
     } as unknown as RuntimeOperations
     const memoryService = service()
     addSecondWritableBody(memoryService)
     const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(runtime, memoryService) as never, toolRegistry().value)
 
     await expect(coordinator.runtime(parent(), { action: 'add', target: 'memory', content: plan.pending!.content }, new AbortController().signal))
-      .rejects.toThrow('omitted committed archive sources')
-    expect(memoryService.rememberMany).not.toHaveBeenCalled()
+      .resolves.toMatchObject({ added: plan.pending!.content, maintenance: { memoryBodyIds: ['project'], summary: expect.stringContaining('routed to project deterministically') } })
+    expect(vi.mocked(memoryService.rememberMany).mock.calls.flatMap(([requests]) => requests.map(item => item.memoryBodyId))).toEqual(['project', 'project'])
     expect(memoryService.remember).not.toHaveBeenCalled()
-    expect(runtime.compactAndMutate).not.toHaveBeenCalled()
+    expect(runtime.compactAndMutate).toHaveBeenCalledOnce()
+  })
+
+  it('preserves earlier valid routes when a later chunk restarts its source indexes', async () => {
+    const plan = maintenancePlan('memory', [
+      { content: 'First source ' + 'a'.repeat(500), importance: 'normal' },
+      { content: 'Second source ' + 'b'.repeat(500), importance: 'normal' },
+      { content: 'Third source ' + 'c'.repeat(500), importance: 'critical' },
+    ])
+    const host = subagents({ action: 'planned', summary: 'Local numbering.', routes: [{ sourceIndexes: [1], memoryBodyId: 'release' }] })
+    host.start.mockResolvedValueOnce({ id: 'first-valid', result: Promise.resolve({ output: [], stopReason: 'completed', structured: {
+      action: 'planned', summary: 'Valid first chunk.', routes: [{ sourceIndexes: [1, 2], memoryBodyId: 'release' }],
+    } }), dispose: vi.fn(async () => {}) })
+    const runtime = {
+      mutate: vi.fn().mockRejectedValueOnce(capacityError('memory', plan.used, plan.projected, plan.limit)),
+      planMaintenance: vi.fn(async () => plan),
+      compactAndMutate: vi.fn(async () => ({ success: true, target: 'memory', added: plan.pending!.content, usage: { used: 20, limit: plan.limit } })),
+    } as unknown as RuntimeOperations
+    const spaces = service()
+    addSecondWritableBody(spaces)
+    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(runtime, spaces), toolRegistry().value)
+    const result = await coordinator.runtime(parent(), { action: 'add', target: 'memory', content: plan.pending!.content }, new AbortController().signal)
+    expect(result.maintenance?.summary).toContain('batch 2 routed to project deterministically')
+    expect(vi.mocked(spaces.rememberMany).mock.calls.flatMap(([requests]) => requests.map(item => ({ content: item.content, memoryBodyId: item.memoryBodyId })))).toEqual(
+      plan.entries.map((entry, index) => ({ content: entry.content, memoryBodyId: index < 2 ? 'release' : 'project' })),
+    )
+    expect(runtime.compactAndMutate).toHaveBeenCalledOnce()
+    expect(host.start).toHaveBeenCalledTimes(2)
+    const prompts = (host.start.mock.calls as unknown as Array<[string, { prompt: Array<{ text: string }> }]>).map(([, call]) => call.prompt[0]!.text)
+    expect(prompts[1]).toContain('Allowed source indexes for this batch: 3. Keep these global indexes; never restart numbering.')
+    for (const prompt of prompts) {
+      const excerpt = prompt.split('<runtime-memory-routing-excerpts>\n')[1]!.split('\n</runtime-memory-routing-excerpts>')[0]!
+      for (const entry of excerpt.split('\n§\n')) expect(entry.replace(/^\d+\. \[importance=\w+\] /, '').length).toBeLessThanOrEqual(384)
+    }
   })
 
   it('deterministically routes to the default store when the routing model fails, then still commits the archive', async () => {
@@ -1558,7 +2380,7 @@ describe('Mnemon memory subagent coordinator', () => {
         },
       })
     expect(host.start).toHaveBeenCalledTimes(2)
-    expect(vi.mocked(memoryService.rememberMany).mock.calls[0]![0].map(request => request.memoryBodyId))
+    expect(vi.mocked(memoryService.rememberMany).mock.calls.flatMap(([requests]) => requests.map(request => request.memoryBodyId)))
       .toEqual(['project', 'project', 'release'])
     expect(coordinator.snapshot()).toMatchObject({
       migrations: 1,
@@ -1666,7 +2488,7 @@ describe('Mnemon memory subagent coordinator', () => {
       maintenance: { kind: 'local-compaction', memoryBodyIds: [] },
     })
     expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({
-      toolFilter: { allow: [expect.stringMatching(/^mnemon_subagent_result_/)] },
+      toolFilter: { allow: ['mnemon_subagent_result'] },
       agentOptions: { maxTokens: 8_192 },
       persona: expect.stringContaining('local USER.md compactor'),
     }))
@@ -1716,7 +2538,7 @@ describe('Mnemon memory subagent coordinator', () => {
   it('disposes failed delegated writes and reports the bounded provider error', async () => {
     const failedChild = {
       ...parent('subagent'),
-      session: { header: { origin: 'subagent' as const }, events: [{ type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'MODEL_ROUTE', message: 'provider rejected sk-secret123456' } } } }] },
+      session: { header: { origin: 'subagent' as const }, ...sessionLog([{ type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'MODEL_ROUTE', message: 'provider rejected sk-secret123456' } } } }]) },
     }
     const host = subagents(undefined, 'error', ['spawn'], failedChild)
     const coordinator = createCoordinator(host.value)
@@ -1734,33 +2556,33 @@ describe('Mnemon memory subagent coordinator', () => {
     expect(host.dispose).toHaveBeenCalledOnce()
   })
 
-  it('pins a fixed task Agent model onto the fork-based idle review delegation', async () => {
+  it('pins a fixed task Agent model onto the bounded idle review delegation', async () => {
     const host = subagents({ summary: 'No mutation needed.', action: 'skipped', memoryBodyIds: [] }, 'completed', ['spawn', 'fork'])
     const resultTools = toolRegistry()
-    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value, () => ({ provider: 'pinned-provider', model: 'pinned-model' }))
+    const coordinator = new MnemonSubagentCoordinator(resultTools.withReviewPublication(host.value), runtimeSource(), resultTools.value, () => ({ provider: 'pinned-provider', model: 'pinned-model' }))
 
     await expect(coordinator.review(parent(), new AbortController().signal)).resolves.toMatchObject({
       delegated: true,
-      provider: 'fork',
+      provider: 'spawn',
       action: 'skipped',
     })
-    expect(host.start).toHaveBeenCalledWith('fork', expect.objectContaining({
-      toolFilter: { allow: expect.arrayContaining(['mnemon_document_search', 'mnemon_runtime_memory', 'mnemon_document_manage']) },
-      agentOptions: { provider: 'pinned-provider', model: 'pinned-model' },
+    expect(host.start).toHaveBeenCalledWith('spawn', expect.objectContaining({
+      toolFilter: { allow: expect.arrayContaining(['mnemon_document_search', 'mnemon_runtime_memory', 'mnemon_document_create']) },
+      agentOptions: { provider: 'pinned-provider', model: 'pinned-model', maxTokens: 4096 },
     }))
   })
 
   it('omits provider/model from agentOptions when the task Agent model is inherited', async () => {
     const host = subagents({ summary: 'No mutation needed.', action: 'skipped', memoryBodyIds: [] }, 'completed', ['spawn', 'fork'])
     const resultTools = toolRegistry()
-    const coordinator = new MnemonSubagentCoordinator(host.value, runtimeSource(), resultTools.value, () => undefined)
+    const coordinator = new MnemonSubagentCoordinator(resultTools.withReviewPublication(host.value), runtimeSource(), resultTools.value, () => undefined)
 
     await expect(coordinator.review(parent(), new AbortController().signal)).resolves.toMatchObject({
       delegated: true,
-      provider: 'fork',
+      provider: 'spawn',
     })
     const reviewCall = (host.start.mock.calls[0] as unknown as [string, { agentOptions?: unknown }])[1]
-    expect(reviewCall.agentOptions).toBeUndefined()
+    expect(reviewCall.agentOptions).toEqual({ maxTokens: 4096 })
   })
 
   it('merges a fixed task Agent model with the configured Runtime maintenance maxTokens', async () => {
@@ -1796,7 +2618,7 @@ describe('Mnemon memory subagent coordinator', () => {
 })
 
 describe('Mnemon root/child tool split', () => {
-  it('routes root/child Recall through the coordinator and child mutations through offered Source actions', async () => {
+  it('routes root and child reads and Runtime writes through the shared coordinator', async () => {
     const f = await compositionFixture()
     releases.push(f.dispose)
     const registered: ToolDefinition[] = []
@@ -1815,7 +2637,7 @@ describe('Mnemon root/child tool split', () => {
     await hot.execute({ action: 'add', target: 'user', content: 'Concise' } as never, { agent: root, signal })
     expect(coordinator.runtime).toHaveBeenCalledWith(root, { action: 'add', target: 'user', content: 'Concise' }, signal)
     await hot.execute({ action: 'add', target: 'memory', content: 'Child fact' } as never, { agent: child, signal })
-    expect(await f.graph.source('runtime').read('snapshot')).toMatchObject({ entries: [expect.objectContaining({ content: 'Child fact' })] })
+    expect(coordinator.runtime).toHaveBeenCalledWith(child, { action: 'add', target: 'memory', content: 'Child fact' }, signal)
     const recall = registered.find(tool => tool.name === 'mnemon_recall')!
     await recall.execute({ query: 'root query' } as never, { agent: root, signal })
     await recall.execute({ query: 'child query', memoryBodyIds: ['project'] } as never, { agent: child, signal })

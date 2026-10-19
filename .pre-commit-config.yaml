@@ -6,8 +6,16 @@ repos:
       - id: detect-private-key
       - id: check-added-large-files
         args: [--maxkb=1024]
+        # Public upstream media/evidence is pinned and separately hash-checked.
+        exclude: '^(docs/assets/webui\-v0\.5\.19/en/plugins\.gif|docs/assets/webui\-v0\.5\.19/en/save\.gif|docs/assets/webui\-v0\.5\.4/en/demo\.mp4|docs/assets/webui\-v0\.5\.4/zh\-CN/demo\.mp4|docs/pr\-assets/issue\-259\-windows\-git\-console/windows\-evidence\.tar\.gz)$'
   - repo: local
     hooks:
+      - id: upstream-assets
+        name: Verify pinned upstream documentation assets
+        entry: python3 .guardrails/upstream-assets.py
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: gitleaks
         name: Scan staged changes for secrets
         entry: gitleaks git --pre-commit --staged --redact --no-banner

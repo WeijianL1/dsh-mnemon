@@ -1,0 +1,3 @@
+
+# Preserve intentional blank context lines in this frozen upstream patch artifact.
+docs/pr-assets/sidebar-native-20260926/upstream-fix.patch whitespace=-blank-at-eol

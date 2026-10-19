@@ -1,5 +1,5 @@
 import { resolve } from 'node:path'
-import type { HostConnectionHandle, HostRpcAuthority, HostRpcHandler } from './dsh.ts'
+import type { HostConnectionHandle, HostRpcHandler } from './dsh.ts'
 import type { MnemonLifecycle } from './lifecycle.ts'
 import type { LiveMnemonRuntime } from './runtime.ts'
 import type { MemoryRuntime } from '../core/runtime.ts'
@@ -35,8 +35,9 @@ export function createViewHandler(runtime: LiveMnemonRuntime, engine: MemoryRunt
       const sessionId = optionalId(payload.sessionId)
       const selectedWorkspaceId = optionalId(payload.workspaceId)
       const route = runtime.route({ ...(sessionId === undefined ? {} : { sessionId }), ...(selectedWorkspaceId === undefined ? {} : { workspaceId: selectedWorkspaceId }) })
-      const workspaceId = route.selectedWorkspace?.path ?? lifecycle?.workspaceRoot(sessionId)
-      const sessionWorkspace = lifecycle?.workspaceRoot(sessionId)
+      // A session whose Agent is not loaded yet keeps the workspace DSH's registry lists it under.
+      const sessionWorkspace = lifecycle?.workspaceRoot(sessionId) ?? route.effectiveWorkspace?.path
+      const workspaceId = route.selectedWorkspace?.path ?? sessionWorkspace
       const aligned = route.aligned && (route.selectedWorkspace === undefined || sessionId === undefined
         || sessionWorkspace !== undefined && resolve(route.selectedWorkspace.path) === resolve(sessionWorkspace))
       const config = management.resolveConfig(runtime.config)
@@ -74,7 +75,13 @@ export function createViewHandler(runtime: LiveMnemonRuntime, engine: MemoryRunt
   }
 }
 
-export function registerViewRpc(connection: HostConnectionHandle, runtime: LiveMnemonRuntime, engine: MemoryRuntime, management: MemoryPluginManagement, lifecycle: MnemonLifecycle, authority: HostRpcAuthority, installation?: MemoryPluginInstallation): void {
-  connection.rpc.handle(MNEMON_VIEW_CHANNEL, createViewHandler(runtime, engine, management, 'read', lifecycle, installation), { authority: 'trusted-host' })
-  connection.rpc.handle(MNEMON_VIEW_WRITE_CHANNEL, createViewHandler(runtime, engine, management, 'write', lifecycle, installation), { authority })
+export function registerViewRpc(connection: HostConnectionHandle, runtime: LiveMnemonRuntime, engine: MemoryRuntime, management: MemoryPluginManagement, lifecycle: MnemonLifecycle, installation?: MemoryPluginInstallation): {
+  read: HostRpcHandler
+  write: HostRpcHandler
+} {
+  const readHandler = createViewHandler(runtime, engine, management, 'read', lifecycle, installation)
+  const writeHandler = createViewHandler(runtime, engine, management, 'write', lifecycle, installation)
+  connection.rpc.handle(MNEMON_VIEW_CHANNEL, readHandler)
+  connection.rpc.handle(MNEMON_VIEW_WRITE_CHANNEL, writeHandler)
+  return { read: readHandler, write: writeHandler }
 }

@@ -9,7 +9,7 @@ import * as autoCapture from 'dsh-mnemon-strategy-auto-capture'
 import * as lightContext from 'dsh-mnemon-strategy-light-context'
 import * as scoped from 'dsh-mnemon-strategy-scoped'
 import native from 'dsh-mnemon-provider-mnemon-native'
-import type { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { compositionFixture } from './fixtures/composition.ts'
 const fixtures: Awaited<ReturnType<typeof compositionFixture>>[] = []
 afterEach(async () => { for (const value of fixtures.splice(0)) await value.dispose() })
@@ -44,7 +44,10 @@ describe('explicit default Starter', () => {
       'dsh-mnemon-source-runtime', 'dsh-mnemon-source-documents', 'dsh-mnemon-source-memory-spaces', 'dsh-mnemon-strategy-default-three-tier',
     ])
     const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
-    expect(patch).toMatch(/    - id: mnemon-bundle\n      name: cordis:group\n      group: true/u)
+    // The group prepares its own dependency resolution, so no separate readiness Entry can hold it back.
+    expect(patch).toMatch(/- insert:\n(?:    #.*\n)*    - id: mnemon-bundle\n      name: dsh-mnemon\/bundle\n      group: true\n      disabled: !!js/u)
+    expect(patch).not.toContain('mnemon-starter')
+    expect(patch).not.toContain('inject:')
     expect(patch).toContain("[...loader.entries()].find(entry => entry.options.id === 'mnemon')")
     expect(patch).toContain('entry.evaluate(entry.options.disabled.__jsExpr)')
     expect(patch).toMatch(/        - id: mnemon\n          # Core\/Host/u)
@@ -68,7 +71,7 @@ describe('explicit default Starter', () => {
       expect(applyProvider).toHaveBeenCalledOnce()
       expect(runner.context.get('mnemonProvider', false)).toBeUndefined()
       expect(runner.inspect().evaluation.sourceInstanceKeys).toEqual(['source:memory-spaces/custom:team'])
-      await expect(spaces.apply({} as Context, { providers: ['not-installed'] })).rejects.toThrow('DSH Loader')
+      await expect(spaces.apply(new Context(), { providers: ['not-installed'] })).rejects.toThrow('DSH Loader')
       await expect(runner.mount(spaces, { instanceId: 'duplicate', config: {
         providers: ['dsh-mnemon-provider-mnemon-native', 'dsh-mnemon-provider-mnemon-native'],
       } })).rejects.toThrow('duplicate Memory Space Provider child')

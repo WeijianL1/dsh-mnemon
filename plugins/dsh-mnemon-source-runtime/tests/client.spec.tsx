@@ -2,10 +2,10 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryCompositionRunner } from 'dsh-mnemon/testing'
-import { translateEn as t } from 'dsh-mnemon/client'
+import { MemorySourcePageFrame, translateEn as t } from 'dsh-mnemon/client'
 import { strategy } from './fixture.ts'
 
 // Load the installed Core's actual DSH browser artifact; no repository source alias.
@@ -23,8 +23,65 @@ afterEach(cleanup)
 
 import * as plugin from '../src/index.ts'
 import { RuntimeSourcePage, installRuntimeMemoryUI } from '../src/client.ts'
+import { RuntimePage } from '../src/client/pages.tsx'
+import type { RuntimeMemorySnapshot } from '../src/contracts.ts'
 
 describe('independent Runtime Source client', () => {
+  it('browses newest creations before pagination and keeps edits in their original position', async () => {
+    const snapshot: RuntimeMemorySnapshot = {
+      directory: '/runtime', sourcePath: '/runtime/memories.json', revision: 'fixture', generatedAt: '2026-09-01T08:00:00Z',
+      targets: {
+        user: { target: 'user', entryCount: 6, used: 100, limit: 4096, markdownPath: '/runtime/USER.md' },
+        memory: { target: 'memory', entryCount: 6, used: 100, limit: 10240, markdownPath: '/runtime/MEMORY.md' },
+      },
+      entries: [3, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(day => ({
+        target: day % 2 === 0 ? 'memory' : 'user', importance: 'normal', content: day === 2 ? 'Entry 2 edited' : `Entry ${day}`,
+        created_at: `2026-08-${String(day).padStart(2, '0')}T08:00:00.000Z`, updated_at: '2026-09-01T08:00:00.000Z',
+      })),
+    }
+    Object.freeze(snapshot.entries)
+    const client = { runtimeMemory: async () => snapshot, mutateRuntimeMemory: vi.fn() }
+    const page = (writable: boolean) => <MemorySourcePageFrame locale="en"><RuntimePage client={client} revision={0} writeEnabled={writable} onMutate={() => {}} /></MemorySourcePageFrame>
+    const view = render(page(false))
+    const listElement = await screen.findByLabelText(t('runtime.entriesAria'))
+    const list = within(listElement)
+    const contents = () => Array.from(listElement.querySelectorAll('article > p'), item => item.textContent)
+    await waitFor(() => expect(contents()).toEqual([12, 11, 10, 9, 8, 7, 6, 5, 4, 3].map(day => `Entry ${day}`)))
+    expect(list.queryByText(t('runtime.editAction'))).toBeNull()
+    fireEvent.click(list.getByText(t('common.showMore', { count: 2 })))
+    expect(contents().slice(-2)).toEqual(['Entry 2 edited', 'Entry 1'])
+    expect(Array.from(listElement.querySelectorAll('article time')).at(-2)?.getAttribute('datetime')).toBe('2026-08-02T08:00:00.000Z')
+    fireEvent.click(list.getByText(t('runtime.target.memory')))
+    expect(contents()).toEqual(['Entry 12', 'Entry 10', 'Entry 8', 'Entry 6', 'Entry 4', 'Entry 2 edited'])
+    fireEvent.change(list.getByLabelText(t('runtime.filterAria')), { target: { value: 'Entry 1' } })
+    expect(contents()).toEqual(['Entry 12', 'Entry 10'])
+    view.rerender(page(true))
+    expect(list.getAllByText(t('runtime.editAction'))).toHaveLength(2)
+    expect(client.mutateRuntimeMemory).not.toHaveBeenCalled()
+  })
+
+  it('marks and reveals the entry a conversation turn wrote, beyond the first page too', async () => {
+    const entries = Array.from({ length: 12 }, (_, index) => ({
+      target: 'memory' as const, importance: 'normal' as const, content: index === 0 ? 'Checkout p75   LCP is 2.4 s after deferring the payment SDK.' : `Entry ${index}`,
+      created_at: `2026-08-${String(index + 1).padStart(2, '0')}T08:00:00.000Z`, updated_at: '2026-09-01T08:00:00.000Z',
+    }))
+    const snapshot = {
+      directory: '/runtime', sourcePath: '/runtime/memories.json', revision: 'fixture', generatedAt: '2026-09-01T08:00:00Z',
+      targets: {
+        user: { target: 'user', entryCount: 0, used: 0, limit: 4096, markdownPath: '/runtime/USER.md' },
+        memory: { target: 'memory', entryCount: 12, used: 100, limit: 10240, markdownPath: '/runtime/MEMORY.md' },
+      },
+      entries,
+    } as RuntimeMemorySnapshot
+    const reveal = vi.fn()
+    render(<MemorySourcePageFrame locale="en"><RuntimePage client={{ runtimeMemory: async () => snapshot, mutateRuntimeMemory: vi.fn() }} revision={0} writeEnabled={false} focusText="Checkout p75 LCP is 2.4 s after…" onRevealElement={reveal} onMutate={() => {}} /></MemorySourcePageFrame>)
+    await waitFor(() => expect(reveal).toHaveBeenCalledTimes(1))
+    const focused = document.querySelectorAll('article[data-focused]')
+    expect(focused).toHaveLength(1)
+    expect(focused[0]!.querySelector('p')?.textContent).toContain('deferring the payment SDK')
+    expect(reveal).toHaveBeenCalledWith(focused[0])
+  })
+
   it('clicks through an actual Source write and keeps a second instance isolated', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mnemon-runtime-client-'))
     const runner = new MemoryCompositionRunner()
@@ -66,6 +123,48 @@ describe('independent Runtime Source client', () => {
       await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
       const { value } = await management.read('snapshot')
       expect((value as { entries: object[] }).entries[0]).not.toHaveProperty('branches')
+    } finally { cleanup(); await runner.dispose(); rmSync(directory, { recursive: true, force: true }) }
+  })
+
+  it('edits and removes exact entries through the real Source without changing containing entries or another instance', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mnemon-runtime-exact-client-'))
+    const runner = new MemoryCompositionRunner()
+    try {
+      await runner.mount(strategy, { instanceId: 'strategy' })
+      for (const id of ['work', 'personal']) await runner.mount(plugin, { instanceId: id, config: { dataDir: join(directory, id) } })
+      const work = await runner.managementClient('source:work')
+      const personal = await runner.managementClient('source:personal')
+      for (const client of [work, personal]) {
+        await client.mutate('mutate', { action: 'add', target: 'memory', content: 'EGO_LINUX_CHROME' }, { confirmed: true })
+        await client.mutate('mutate', { action: 'add', target: 'memory', content: 'X', branches: ['main'] }, { confirmed: true })
+      }
+      const otherBefore = await personal.read('snapshot')
+      const props = { sourceTypeId: 'runtime', sourceInstanceKey: 'source:work', sourceInstances: [], locale: 'en', management: work }
+      const view = render(<RuntimeSourcePage {...props} writable={false} />)
+      await screen.findByText('X')
+      expect(screen.queryByRole('button', { name: t('runtime.editAction') })).toBeNull()
+      expect(screen.queryByRole('button', { name: t('runtime.removeAction') })).toBeNull()
+
+      view.rerender(<RuntimeSourcePage {...props} writable />)
+      fireEvent.click(within(screen.getByText('X').closest('article')!).getByRole('button', { name: t('runtime.editAction') }))
+      fireEvent.change(screen.getByRole('textbox', { name: t('runtime.editContent') }), { target: { value: 'LINUX' } })
+      fireEvent.click(screen.getByRole('button', { name: t('runtime.saveEdit') }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      expect((await work.read('snapshot')).value).toMatchObject({ entries: [
+        { content: 'EGO_LINUX_CHROME' }, { content: 'LINUX', branches: ['main'] },
+      ] })
+
+      fireEvent.click(within(screen.getByText('LINUX').closest('article')!).getByRole('button', { name: t('runtime.removeAction') }))
+      fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: t('runtime.removeAction') }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      expect(screen.queryByText('LINUX')).toBeNull()
+      expect(screen.getByText('EGO_LINUX_CHROME')).not.toBeNull()
+      expect((await work.read('snapshot')).value).toMatchObject({ entries: [{ content: 'EGO_LINUX_CHROME' }] })
+      const otherAfter = await personal.read('snapshot')
+      expect(otherAfter.revision).toBe(otherBefore.revision)
+      expect(otherAfter.value).toMatchObject({ entries: [
+        { content: 'EGO_LINUX_CHROME' }, { content: 'X', branches: ['main'] },
+      ] })
     } finally { cleanup(); await runner.dispose(); rmSync(directory, { recursive: true, force: true }) }
   })
 

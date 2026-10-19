@@ -2,9 +2,11 @@
 
 **简体中文** | [English](../../en/reference/workflows.md) | [文档中心](../README.md)
 
+本页描述默认的**分层策略**。**通用策略**在同一份预算内提供全部可用 Source，由模型决定如何路由：具名工具服务各自的 Source，其余路由通过 `mnemon_view_route` 读取、`mnemon_view_action` 修改。它除各路由自身的上限外没有召回准入信封，不做 Runtime 容量维护与归档，也不做空闲审查。见[策略与增强](../guides/capabilities.md#策略与增强)。
+
 ## 每轮上下文
 
-默认组合提供稳定的路由指引、静态 Runtime Memory 协议，以及按需更新的 Wake 快照消息：
+分层策略提供稳定的路由指引、静态 Runtime Memory 协议，以及按需更新的 Wake 快照消息：
 
 - `mnemon:routing`：system prompt section；当 `routingGuidance=true` 时提供简短的分层查询边界；
 - `mnemon:runtime-memory-protocol`：system prompt section，只包含不变的 Runtime Memory 语义与写入规则。它只在 eager Runtime Source 参与自动投影时出现，记忆变更前后保持逐字节一致；
@@ -73,6 +75,8 @@ LLM 判断 evidence 是否足够
 总正文 4,800 字符的总预算
 ```
 
+这一准入信封是分层策略的每回合策略；通用策略只应用各路由自身的上限与调用预算。
+
 模型工具不暴露 `category`、`source` 或 `intent` 过滤器：模型猜错过滤条件不能遮住精确证据。Recall 并非强制执行，普通 root 回合是 0 次 Provider 查询。LLM 主动调用后，Host 允许一个首次查询；只有 LLM 查看 evidence 后仍认为不足，才允许再提交一个实质不同的精炼查询。同查询和并发重复请求会 join 或重放；第三个不同查询只重放最新 evidence，不再到达 Provider。随后至多执行一次 Related，而且只能使用两次 Recall 任一已准入的 `memoryBodyId + id`；重复 Related 同样重放结果。
 
 Recall、Related 和单次 Documents 搜索槽位按执行中的 Agent 回合计预算。同一回合内并发调用共享状态，兄弟任务、后续回合和冷恢复的 activation 不会共享缓存 evidence 或占用彼此的预算。重放结果限于本次请求的 Memory Space 子集。Document search 另有独立边界：最多 4 条记录、每条最多 2,600 个查询附近字符、总正文最多 6,000 字符。模型侧 Memory Space 目录最多 16 项，`mnemon_status` 只返回紧凑健康汇总。完整记录、Provider 设置、路径和逐 Space 统计仍由 Web/RPC 控制面读取，不进入对话历史。
@@ -135,9 +139,11 @@ Agent 查询
   -> 返回紧凑回执
 ```
 
-`replace` 和 `remove` 必须通过 `old_text` 唯一命中一条。只有请求中的 add 或增大正文的 replace 会超过目标上限时，才触发容量维护。
+`replace` 和 `remove` 在请求的目标内，优先用 `old_text` 唯一匹配完整正文；没有精确匹配时才使用唯一子串。重复的完整正文仍视为有歧义。只有请求中的 add 或增大正文的 replace 会超过目标上限时，才触发容量维护。
 
 ## USER.md 容量整理
+
+容量整理与下文的 MEMORY.md 归档都属于分层策略。使用通用策略时，超出 Runtime 上限的写入会被直接拒绝。
 
 ```text
 USER 新增后超过 4 KiB
@@ -173,21 +179,22 @@ Host 校验：
 ## MEMORY.md 归档与压缩
 
 ```text
-MEMORY 新增后超过 10 KiB
+分层策略下，本次 MEMORY 写入将超过配置上限（默认 10 KiB）
           |
           v
 snapshot revision + 可归档的已提交 entries
 （排除待提交 add，以及正被 replace/remove 的 entry）
           |
           v
-Host 选择已有、active、可写的 Memory Spaces
+Host 在本次操作的 Source / 命名空间范围内选择已有、active、可写的 Memory Spaces
           |
           v
-spawn 无工具 planner
-  output: 完整 source-index 路由 + 有界压缩候选
+单个目标：Host 直接路由
+多个目标：独立无工具 worker 只返回 source-index 路由
+  模型执行失败时，Host 在合格目标中确定性兜底
           |
           v
-Host 校验精确 source coverage、目标、候选和字节预算
+Host 校验精确 source coverage、目标、权限与源修订
           |
           +-- 无效/revision 已变 -> 不写 Provider；保留 Runtime
           |
@@ -195,6 +202,9 @@ Host 校验精确 source coverage、目标、候选和字节预算
 Host 把每条原始 entry 精确写入规划的已有 Space
   - committed receipt -> 绑定目标 digest
   - skipped -> 必须取得完全一致的 Recall evidence
+          |
+          v
+Host 按重要性与字节预算保留原始热记忆条目
           |
           v
 CAS compactAndMutate(revision, compaction, original mutation, lineage)
@@ -284,28 +294,36 @@ Host 判断是否存在待整理内容
     >=600 助手字符或已完成非 Mnemon 工作 -> 继续
       |
       v
-等待 idleReviewMs（默认 30 秒）
+等待 idleReviewMs（默认 30 秒），且距上次尝试
+至少 idleReview.minIntervalMs（默认 5 分钟）
       |
       +-- 新回合 --> 取消定时器/任务，保留累计活动
       |
       v
-确认 Agent 已空闲且已有 turn/end
+确认 Agent 已空闲、已有 turn/end、该回合由分层策略组合，
+且未达到 idleReview.maxPerSession
       |
       v
-派发继承已完成父执行检查点的子任务
+就已完成的回合启动任务 Agent
+  - spawn（默认）：有界检查点，上限 idleReview.maxContextChars
+  - fork：继承父 Agent 上下文
       |
       v
-保守的整理决策
-  - persona 约束至多一次热记忆修改
-  - persona 约束至多一次档案创建/更新
-  - 不提供长期 remember/forget 直写工具
+保守的整理决策，每轮只写一层
+  - 先看档案：先检索；项目记录至多新建一份独立档案，
+    不更新或归档已有档案
+  - 热记忆：只收录用户新提出的、明确且持久的陈述；
+    MEMORY.md 只收档案未涵盖的简短规则，不收项目记录
+    （idleReview.runtimeMemory: false 时关闭）
+  - 建了档案就不能再改工作记忆，反之亦然
+  - 不提供记忆空间写入工具
       |
       +-- 已完成（含跳过）--> 清空累计活动
       |
       +-- 失败/中止 --------> 保留累计活动
 ```
 
-admission 有意只使用结构信号，不调用 LLM 分类；因此达到 activity 门槛但没有 dirty candidate 的普通 checkpoint 不会启动后台模型。“最多一次”当前由 worker persona 约束，不是 Host mutation counter。后台水位尚未持久化，Host 重启会丢失未处理的累计信号。
+admission 有意只使用结构信号，不调用 LLM 分类；因此达到 activity 门槛但没有 dirty candidate 的普通 checkpoint 不会启动后台模型。审查 Agent 的工具恰好是 `mnemon_document_search`、`mnemon_runtime_memory` 与 `mnemon_document_create`；`idleReview.runtimeMemory` 为 `false` 时不提供运行时记忆工具。审查 guard 让每轮只写一层：它放行的第一次新建档案或工作记忆修改决定本轮所写的层，另一层随后被拒绝，即使第一次调用失败也是如此；USER.md 的修改不受影响。“至多一份”档案或一次热记忆修改仍由 persona 约束，不是 Host mutation counter。审查的产出之后才进入记忆空间：工作记忆在容量整理时归档，项目档案在冷归档时建立索引。安装了 Agent Teams 工具时，除非设置 `idleReview.agentTeams: scoped`，审查会暂停；暂停期间状态页会给出提示。后台水位尚未持久化，Host 重启会丢失未处理的累计信号。
 
 ## 配置开关的关系
 
